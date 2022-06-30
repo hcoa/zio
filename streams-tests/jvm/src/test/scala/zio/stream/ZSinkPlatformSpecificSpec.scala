@@ -1,32 +1,51 @@
 package zio.stream
 
 import zio._
-import zio.blocking.Blocking
 import zio.test.Assertion._
 import zio.test._
 
+import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.Files
 import java.security.MessageDigest
 
 object ZSinkPlatformSpecificSpec extends ZIOBaseSpec {
-  override def spec: Spec[Blocking, TestFailure[Throwable], TestSuccess] = suite("ZSink JVM")(
+
+  override def spec: Spec[Any, Throwable] = suite("ZSink JVM")(
     suite("fromFile")(
-      testM("writes to an existing file") {
+      test("writes to an existing file") {
         val data = (0 to 100).mkString
 
-        Task(Files.createTempFile("stream", "fromFile"))
-          .bracket(path => Task(Files.delete(path)).orDie) { path =>
-            for {
-              bytes  <- Task(data.getBytes("UTF-8"))
-              length <- ZStream.fromIterable(bytes).run(ZSink.fromFile(path))
-              str    <- Task(new String(Files.readAllBytes(path)))
-            } yield assert(data)(equalTo(str)) && assert(bytes.length.toLong)(equalTo(length))
+        ZIO.acquireReleaseWith {
+          ZIO.attempt(Files.createTempFile("stream", "fromFile"))
+        } { path =>
+          ZIO.attempt(Files.delete(path)).orDie
+        } { path =>
+          for {
+            bytes  <- ZIO.attempt(data.getBytes(UTF_8))
+            length <- ZStream.fromIterable(bytes).run(ZSink.fromPath(path))
+            str    <- ZIO.attempt(new String(Files.readAllBytes(path)))
+          } yield {
+            assertTrue(data == str) &&
+            assertTrue(bytes.length.toLong == length)
           }
+        }
+      }
+    ),
+    suite("fromOutputStream")(
+      test("writes to byte array output stream") {
+        val data = (0 to 100).mkString
 
+        for {
+          bytes  <- ZIO.attempt(data.getBytes("UTF-8"))
+          os      = new ByteArrayOutputStream(data.length)
+          length <- ZStream.fromIterable(bytes).run(ZSink.fromOutputStream(os))
+          str    <- ZIO.attempt(os.toString("UTF-8"))
+        } yield assert(data)(equalTo(str)) && assert(bytes.length.toLong)(equalTo(length))
       }
     ),
     suite("digest")(
-      testM("should calculate digest for a stream") {
+      test("should calculate digest for a stream") {
         for {
           res <- ZStream
                    .fromIterable("Hello!".getBytes())
@@ -39,7 +58,7 @@ object ZSinkPlatformSpecificSpec extends ZIOBaseSpec {
           )
         }
       },
-      testM("should calculate digest for an empty stream") {
+      test("should calculate digest for an empty stream") {
         for {
           res <- ZStream.empty
                    .run(ZSink.digest(MessageDigest.getInstance("SHA-1")))

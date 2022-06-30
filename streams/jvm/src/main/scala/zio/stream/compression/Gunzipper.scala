@@ -17,6 +17,7 @@
 package zio.stream.compression
 
 import zio._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.util.zip.{CRC32, Inflater}
 import java.{util => ju}
@@ -35,8 +36,8 @@ private[compression] class Gunzipper private (bufferSize: Int) {
 
   def close(): Unit = state.close()
 
-  def onChunk(c: Chunk[Byte]): ZIO[Any, CompressionException, Chunk[Byte]] =
-    ZIO.effect {
+  def onChunk(c: Chunk[Byte])(implicit trace: Trace): ZIO[Any, CompressionException, Chunk[Byte]] =
+    ZIO.attempt {
       val (newState, output) = state.feed(c.toArray)
       state = newState
       output
@@ -45,9 +46,9 @@ private[compression] class Gunzipper private (bufferSize: Int) {
       case e: CompressionException       => e
     }
 
-  def onNone: ZIO[Any, CompressionException, Chunk[Byte]] =
+  def onNone(implicit trace: Trace): ZIO[Any, CompressionException, Chunk[Byte]] =
     if (state.isInProgress) ZIO.fail(CompressionException("Stream closed before completion."))
-    else ZIO.effectTotal(Chunk.empty)
+    else ZIO.succeed(Chunk.empty)
 
   private def nextStep(
     acc: Array[Byte],
@@ -205,5 +206,6 @@ private[stream] object Gunzipper {
     def isInProgress: Boolean = true
   }
 
-  def make(bufferSize: Int): ZIO[Any, Nothing, Gunzipper] = ZIO.succeed(new Gunzipper(bufferSize))
+  def make(bufferSize: Int)(implicit trace: Trace): ZIO[Any, Nothing, Gunzipper] =
+    ZIO.succeed(new Gunzipper(bufferSize))
 }

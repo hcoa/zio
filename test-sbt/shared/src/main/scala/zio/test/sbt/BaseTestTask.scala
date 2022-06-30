@@ -1,56 +1,58 @@
 package zio.test.sbt
 
-import sbt.testing.{EventHandler, Logger, Task, TaskDef}
-import zio.clock.Clock
-import zio.test.{AbstractRunnableSpec, FilteredSpec, SummaryBuilder, TestArgs, TestLogger}
-import zio.{Layer, Runtime, UIO, ZIO, ZLayer}
+import sbt.testing.{Event, EventHandler, Logger, Status, Task, TaskDef}
+import zio.{CancelableFuture, Console, Runtime, Scope, Trace, UIO, Unsafe, ZEnvironment, ZIO, ZIOAppArgs, ZLayer}
+import zio.test.render.ConsoleRenderer
+import zio.test._
 
-abstract class BaseTestTask(
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
+abstract class BaseTestTask[T](
   val taskDef: TaskDef,
   val testClassLoader: ClassLoader,
   val sendSummary: SendSummary,
-  val args: TestArgs
+  val args: TestArgs,
+  val spec: ZIOSpecAbstract,
+  val runtime: zio.Runtime[T]
 ) extends Task {
 
-  protected lazy val specInstance: AbstractRunnableSpec = {
-    import org.portablescala.reflect._
-    val fqn = taskDef.fullyQualifiedName().stripSuffix("$") + "$"
-    Reflect
-      .lookupLoadableModuleClass(fqn, testClassLoader)
-      .getOrElse(throw new ClassNotFoundException("failed to load object: " + fqn))
-      .loadModule()
-      .asInstanceOf[AbstractRunnableSpec]
-  }
+  protected def sharedFilledTestLayer(implicit
+    trace: Trace
+  ): ZLayer[Any, Nothing, TestEnvironment with ZIOAppArgs with Scope] = {
+    ZIOAppArgs.empty +!+ (
+      (liveEnvironment ++ Scope.default) >>> TestEnvironment.live
+    )
+  } +!+ Scope.default
 
-  protected def run(eventHandler: EventHandler): ZIO[TestLogger with Clock, Throwable, Unit] =
-    for {
-      spec   <- specInstance.runSpec(FilteredSpec(specInstance.spec, args))
-      summary = SummaryBuilder.buildSummary(spec)
-      _      <- sendSummary.provide(summary)
-      events  = ZTestEvent.from(spec, taskDef.fullyQualifiedName(), taskDef.fingerprint())
-      _      <- ZIO.foreach(events)(e => ZIO.effect(eventHandler.handle(e)))
-    } yield ()
+  private[zio] def run(
+    eventHandlerZ: ZTestEventHandler
+  )(implicit trace: Trace): ZIO[Any, Throwable, Unit] =
+    (for {
+      summary <- spec.runSpecWithSharedRuntimeLayer(spec.spec, args, runtime, eventHandlerZ)
+      _       <- sendSummary.provideEnvironment(ZEnvironment(summary))
+    } yield ())
+      .provideLayer(sharedFilledTestLayer)
 
-  protected def sbtTestLayer(loggers: Array[Logger]): Layer[Nothing, TestLogger with Clock] =
-    ZLayer.succeed[TestLogger.Service](new TestLogger.Service {
-      def logLine(line: String): UIO[Unit] =
-        ZIO.effect(loggers.foreach(_.info(colored(line)))).ignore
-    }) ++ Clock.live
+  override def execute(eventHandler: EventHandler, loggers: Array[Logger]): Array[Task] = {
+    implicit val trace = Trace.empty
 
-  override def execute(eventHandler: EventHandler, loggers: Array[Logger]): Array[Task] =
+    val zTestHandler                      = new ZTestEventHandlerSbt(eventHandler, taskDef)
+    var resOutter: CancelableFuture[Unit] = null
     try {
-      Runtime((), specInstance.platform).unsafeRun {
-        run(eventHandler)
-          .provideLayer(sbtTestLayer(loggers))
-          .onError(e => UIO(println(e.prettyPrint)))
-      }
+      val res: CancelableFuture[Unit] =
+        runtime.unsafe.runToFuture(run(zTestHandler))(trace, Unsafe.unsafe)
+
+      resOutter = res
+      Await.result(res, Duration.Inf)
       Array()
     } catch {
       case t: Throwable =>
-        t.printStackTrace()
+        if (resOutter != null) resOutter.cancel()
         throw t
     }
+  }
 
   override def tags(): Array[String] = Array.empty
-
 }

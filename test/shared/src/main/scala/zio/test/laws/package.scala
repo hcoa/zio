@@ -17,6 +17,8 @@
 package zio.test
 
 import zio.ZIO
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+import zio.Trace
 
 /**
  * The `laws` package provides functionality for describing laws as values. The
@@ -72,7 +74,7 @@ import zio.ZIO
  *
  * object Ord extends Lawful[Ord]
  *
- * checkAllLaws(Equal + Hash + Ord)(Gen.anyInt)
+ * checkAllLaws(Equal + Hash + Ord)(Gen.int)
  * }}}
  *
  * Note that capabilities compose seamlessly because of contravariance. We can
@@ -99,12 +101,12 @@ package object laws {
   }
 
   object Laws {
-    type Law1[-Caps[_]]  = ZLaws.Law1[Caps]
-    type Law1M[-Caps[_]] = ZLaws.Law1M[Caps, Any]
-    type Law2[-Caps[_]]  = ZLaws.Law2[Caps]
-    type Law2M[-Caps[_]] = ZLaws.Law2M[Caps, Any]
-    type Law3[-Caps[_]]  = ZLaws.Law3[Caps]
-    type Law3M[-Caps[_]] = ZLaws.Law3M[Caps, Any]
+    type Law1[-Caps[_]]    = ZLaws.Law1[Caps]
+    type Law1ZIO[-Caps[_]] = ZLaws.Law1ZIO[Caps, Any]
+    type Law2[-Caps[_]]    = ZLaws.Law2[Caps]
+    type Law2ZIO[-Caps[_]] = ZLaws.Law2ZIO[Caps, Any]
+    type Law3[-Caps[_]]    = ZLaws.Law3[Caps]
+    type Law3ZIO[-Caps[_]] = ZLaws.Law3ZIO[Caps, Any]
   }
 
   object Laws2 {
@@ -122,30 +124,30 @@ package object laws {
       type ComposeLaw[-CapsF[_[+_]], -Caps[_]] = ZLawsF.Covariant.ComposeLaw[CapsF, Caps]
       type FlattenLaw[-CapsF[_[+_]], -Caps[_]] = ZLawsF.Covariant.FlattenLaw[CapsF, Caps]
       type Law1[-CapsF[_[+_]], -Caps[_]]       = ZLawsF.Covariant.Law1[CapsF, Caps]
-      type Law1M[-CapsF[_[+_]], -Caps[_]]      = ZLawsF.Covariant.Law1M[CapsF, Caps, Any]
+      type Law1ZIO[-CapsF[_[+_]], -Caps[_]]    = ZLawsF.Covariant.Law1ZIO[CapsF, Caps, Any]
       type Law2[-CapsF[_[+_]], -Caps[_]]       = ZLawsF.Covariant.Law2[CapsF, Caps]
-      type Law2M[-CapsF[_[+_]], -Caps[_]]      = ZLawsF.Covariant.Law2M[CapsF, Caps, Any]
+      type Law2ZIO[-CapsF[_[+_]], -Caps[_]]    = ZLawsF.Covariant.Law2ZIO[CapsF, Caps, Any]
       type Law3[-CapsF[_[+_]], -Caps[_]]       = ZLawsF.Covariant.Law3[CapsF, Caps]
-      type Law3M[-CapsF[_[+_]], -Caps[_]]      = ZLawsF.Covariant.Law3M[CapsF, Caps, Any]
+      type Law3ZIO[-CapsF[_[+_]], -Caps[_]]    = ZLawsF.Covariant.Law3ZIO[CapsF, Caps, Any]
     }
 
     object Contravariant {
       type ComposeLaw[-CapsF[_[-_]], -Caps[_]] = ZLawsF.Contravariant.ComposeLaw[CapsF, Caps]
       type Law1[-CapsF[_[-_]], -Caps[_]]       = ZLawsF.Contravariant.Law1[CapsF, Caps]
-      type Law1M[-CapsF[_[-_]], -Caps[_]]      = ZLawsF.Contravariant.Law1M[CapsF, Caps, Any]
+      type Law1ZIO[-CapsF[_[-_]], -Caps[_]]    = ZLawsF.Contravariant.Law1ZIO[CapsF, Caps, Any]
       type Law2[-CapsF[_[-_]], -Caps[_]]       = ZLawsF.Contravariant.Law2[CapsF, Caps]
-      type Law2M[-CapsF[_[-_]], -Caps[_]]      = ZLawsF.Contravariant.Law2M[CapsF, Caps, Any]
+      type Law2ZIO[-CapsF[_[-_]], -Caps[_]]    = ZLawsF.Contravariant.Law2ZIO[CapsF, Caps, Any]
       type Law3[-CapsF[_[-_]], -Caps[_]]       = ZLawsF.Contravariant.Law3[CapsF, Caps]
-      type Law3M[-CapsF[_[-_]], -Caps[_]]      = ZLawsF.Contravariant.Law3M[CapsF, Caps, Any]
+      type Law3ZIO[-CapsF[_[-_]], -Caps[_]]    = ZLawsF.Contravariant.Law3ZIO[CapsF, Caps, Any]
     }
 
     object Invariant {
-      type Law1[-CapsF[_[_]], -Caps[_]]  = ZLawsF.Invariant.Law1[CapsF, Caps]
-      type Law1M[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law1M[CapsF, Caps, Any]
-      type Law2[-CapsF[_[_]], -Caps[_]]  = ZLawsF.Invariant.Law2[CapsF, Caps]
-      type Law2M[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law2M[CapsF, Caps, Any]
-      type Law3[-CapsF[_[_]], -Caps[_]]  = ZLawsF.Invariant.Law3[CapsF, Caps]
-      type Law3M[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law3M[CapsF, Caps, Any]
+      type Law1[-CapsF[_[_]], -Caps[_]]    = ZLawsF.Invariant.Law1[CapsF, Caps]
+      type Law1ZIO[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law1ZIO[CapsF, Caps, Any]
+      type Law2[-CapsF[_[_]], -Caps[_]]    = ZLawsF.Invariant.Law2[CapsF, Caps]
+      type Law2ZIO[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law2ZIO[CapsF, Caps, Any]
+      type Law3[-CapsF[_[_]], -Caps[_]]    = ZLawsF.Invariant.Law3[CapsF, Caps]
+      type Law3ZIO[-CapsF[_[_]], -Caps[_]] = ZLawsF.Invariant.Law3ZIO[CapsF, Caps, Any]
     }
   }
 
@@ -166,7 +168,7 @@ package object laws {
    */
   def checkAllLaws[Caps[_], R <: TestConfig, R1 <: R, A: Caps](
     lawful: ZLawful[Caps, R]
-  )(gen: Gen[R1, A]): ZIO[R1, Nothing, TestResult] =
+  )(gen: Gen[R1, A])(implicit trace: Trace): ZIO[R1, Nothing, TestResult] =
     lawful.laws.run(gen)
 
   /**
@@ -175,12 +177,15 @@ package object laws {
    */
   def checkAllLaws[CapsBoth[_, _], CapsLeft[_], CapsRight[_], R <: TestConfig, R1 <: R, A: CapsLeft, B: CapsRight](
     lawful: ZLawful2[CapsBoth, CapsLeft, CapsRight, R]
-  )(a: Gen[R1, A], b: Gen[R1, B])(implicit CapsBoth: CapsBoth[A, B]): ZIO[R1, Nothing, TestResult] =
+  )(a: Gen[R1, A], b: Gen[R1, B])(implicit
+    CapsBoth: CapsBoth[A, B],
+    trace: Trace
+  ): ZIO[R1, Nothing, TestResult] =
     lawful.laws.run(a, b)
 
   def checkAllLaws[CapsF[_[+_]], Caps[_], R <: TestConfig, R1 <: R, F[+_]: CapsF, A: Caps](
     lawful: ZLawfulF.Covariant[CapsF, Caps, R]
-  )(genF: GenF[R1, F], gen: Gen[R1, A]): ZIO[R1, Nothing, TestResult] =
+  )(genF: GenF[R1, F], gen: Gen[R1, A])(implicit trace: Trace): ZIO[R1, Nothing, TestResult] =
     lawful.laws.run(genF, gen)
 
   /**
@@ -189,7 +194,7 @@ package object laws {
    */
   def checkAllLaws[CapsF[_[-_]], Caps[_], R <: TestConfig, R1 <: R, F[-_]: CapsF, A: Caps](
     lawful: ZLawfulF.Contravariant[CapsF, Caps, R]
-  )(genF: GenF[R1, F], gen: Gen[R1, A]): ZIO[R1, Nothing, TestResult] =
+  )(genF: GenF[R1, F], gen: Gen[R1, A])(implicit trace: Trace): ZIO[R1, Nothing, TestResult] =
     lawful.laws.run(genF, gen)
 
   /**
@@ -198,6 +203,6 @@ package object laws {
    */
   def checkAllLaws[CapsF[_[_]], Caps[_], R <: TestConfig, R1 <: R, F[_]: CapsF, A: Caps](
     lawful: ZLawfulF.Invariant[CapsF, Caps, R]
-  )(genF: GenF[R1, F], gen: Gen[R1, A]): ZIO[R1, Nothing, TestResult] =
+  )(genF: GenF[R1, F], gen: Gen[R1, A])(implicit trace: Trace): ZIO[R1, Nothing, TestResult] =
     lawful.laws.run(genF, gen)
 }

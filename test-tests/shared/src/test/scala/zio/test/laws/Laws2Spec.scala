@@ -7,7 +7,7 @@ object Laws2Spec extends ZIOBaseSpec {
   type AnyF[_] = Any
 
   def equalTo[A: Equal](expected: A): Assertion[A] =
-    Assertion.assertion("equalTo")(Assertion.Render.param(expected))(_ === expected)
+    Assertion.assertion("equalTo")(_ === expected)
 
   implicit class AssertEqualToSyntax[A](private val self: A) extends AnyVal {
     def <->(that: A)(implicit eq: Equal[A]): TestResult =
@@ -58,18 +58,18 @@ object Laws2Spec extends ZIOBaseSpec {
       Equivalence(_.mkString, _.toList)
   }
 
-  def spec: ZSpec[Environment, Failure] =
+  def spec =
     suite("Laws2Spec") {
       suite("equivalenceLaws")(
-        testM("byteList <=> byteVector") {
-          val genByteList          = Gen.listOf(Gen.anyByte)
-          val genByteVector        = Gen.vectorOf(Gen.anyByte)
+        test("byteList <=> byteVector") {
+          val genByteList          = Gen.listOf(Gen.byte)
+          val genByteVector        = Gen.vectorOf(Gen.byte)
           implicit val equivalence = Equivalence.byteListByteVectorEquivalence
           checkAllLaws(Equivalence)(genByteList, genByteVector)
         },
-        testM("charList <=> String") {
-          val genCharList          = Gen.listOf(Gen.anyChar)
-          val genString            = Gen.anyString
+        test("charList <=> String") {
+          val genCharList          = Gen.listOf(Gen.char)
+          val genString            = Gen.string
           implicit val equivalence = Equivalence.charListStringEquivalence
           checkAllLaws(Equivalence)(genCharList, genString)
         }

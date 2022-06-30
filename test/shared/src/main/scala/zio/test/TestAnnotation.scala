@@ -16,8 +16,12 @@
 
 package zio.test
 
-import zio.duration._
-import zio.{Chunk, Fiber, Tag}
+import zio._
+import zio.internal.stacktracer.SourceLocation
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
+import java.util.concurrent.atomic.AtomicReference
+import scala.collection.immutable.SortedSet
 
 /**
  * A type of annotation.
@@ -26,7 +30,7 @@ final class TestAnnotation[V] private (
   val identifier: String,
   val initial: V,
   val combine: (V, V) => V,
-  private val tag: Tag[V]
+  private val tag: EnvironmentTag[V]
 ) extends Serializable {
 
   override def equals(that: Any): Boolean = (that: @unchecked) match {
@@ -39,7 +43,9 @@ final class TestAnnotation[V] private (
 
 object TestAnnotation {
 
-  def apply[V](identifier: String, initial: V, combine: (V, V) => V)(implicit tag: Tag[V]): TestAnnotation[V] =
+  def apply[V](identifier: String, initial: V, combine: (V, V) => V)(implicit
+    tag: EnvironmentTag[V]
+  ): TestAnnotation[V] =
     new TestAnnotation(identifier, initial, combine, tag)
 
   /**
@@ -69,22 +75,18 @@ object TestAnnotation {
   /**
    * An annotation for timing.
    */
-  val timing: TestAnnotation[Duration] =
-    TestAnnotation("timing", Duration.Zero, _ + _)
+  val timing: TestAnnotation[TestDuration] =
+    TestAnnotation("timing", TestDuration.zero, _ <> _)
 
   /**
-   * An annotation for capturing the source location (file name and line number)
-   * of the calling test.
+   * An annotation for capturing the trace information, including source
+   * location (i.e. file name and line number) of the calling test.
    */
-  val location: TestAnnotation[List[SourceLocation]] =
-    TestAnnotation("location", List.empty, _ ++ _)
+  private[zio] val trace: TestAnnotation[List[SourceLocation]] =
+    TestAnnotation("trace", List.empty, _ ++ _)
 
-  import zio.Ref
-
-  import scala.collection.immutable.SortedSet
-
-  val fibers: TestAnnotation[Either[Int, Chunk[Ref[SortedSet[Fiber.Runtime[Any, Any]]]]]] =
-    TestAnnotation("fibers", Left(0), compose(_, _))
+  val fibers: TestAnnotation[Either[Int, Chunk[AtomicReference[SortedSet[Fiber.Runtime[Any, Any]]]]]] =
+    TestAnnotation("fibers", Left(0), compose)
 
   def compose[A](left: Either[Int, Chunk[A]], right: Either[Int, Chunk[A]]): Either[Int, Chunk[A]] =
     (left, right) match {

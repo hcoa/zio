@@ -1,19 +1,17 @@
 import com.github.ghik.silencer.silent
 import zio.test._
 
-object REPLSpec extends DefaultRunnableSpec {
+object REPLSpec extends ZIOSpecDefault {
 
-  @silent("Unused import")
-  def spec: ZSpec[Environment, Failure] = suite("REPLSpec")(
+  def spec = suite("REPLSpec")(
     test("settings compile") {
-      import zio.Runtime.default._
       import zio._
-      import zio.console._
-      import zio.duration._
       @silent("never used")
-      implicit class RunSyntax[A](io: ZIO[ZEnv, Any, A]) {
+      implicit class RunSyntax[A](io: ZIO[Any, Any, A]) {
         def unsafeRun: A =
-          Runtime.default.unsafeRun(io.provideLayer(ZEnv.live))
+          Unsafe.unsafe { implicit unsafe =>
+            Runtime.default.unsafe.run(io).getOrThrowFiberFailure()
+          }
       }
       assertCompletes
     }

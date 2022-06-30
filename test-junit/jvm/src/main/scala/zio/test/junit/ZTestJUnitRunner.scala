@@ -19,20 +19,21 @@ package zio.test.junit
 import org.junit.runner.manipulation.{Filter, Filterable}
 import org.junit.runner.notification.{Failure, RunNotifier}
 import org.junit.runner.{Description, RunWith, Runner}
-import zio.ZIO.effectTotal
+import zio.ZIO.succeed
 import zio._
-import zio.test.FailureRenderer.FailureMessage.Message
-import zio.test.RenderedResult.CaseType.Test
-import zio.test.RenderedResult.Status.Failed
 import zio.test.TestFailure.{Assertion, Runtime}
 import zio.test.TestSuccess.{Ignored, Succeeded}
 import zio.test._
+import zio.test.render.ConsoleRenderer
+import zio.test.render.ExecutionResult.ResultType.Test
+import zio.test.render.ExecutionResult.Status.Failed
+import zio.test.render.LogLine.Message
 
 /**
  * Custom JUnit 4 runner for ZIO Test Specs.<br/> Any instance of
- * [[zio.test.AbstractRunnableSpec]], that is a class (JUnit won't run objects),
- * if annotated with `@RunWith(classOf[ZTestJUnitRunner])` can be run by IDEs
- * and build tools that support JUnit.<br/> Your spec can also extend
+ * [[zio.test.ZIOSpecAbstract]], that is a class (JUnit won't run objects), if
+ * annotated with `@RunWith(classOf[ZTestJUnitRunner])` can be run by IDEs and
+ * build tools that support JUnit.<br/> Your spec can also extend
  * [[JUnitRunnableSpec]] to inherit the annotation. In order to expose the
  * structure of the test to JUnit (and the external tools), `getDescription` has
  * to execute Suite level effects. This means that these effects will be
@@ -40,14 +41,15 @@ import zio.test._
  * Scala.JS is not supported, as JUnit TestFramework for SBT under Scala.JS
  * doesn't support custom runners.
  */
-class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with BootstrapRuntime {
+class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable {
+
   private val className = klass.getName.stripSuffix("$")
 
-  private lazy val spec: AbstractRunnableSpec = {
+  private lazy val spec: ZIOSpecAbstract = {
     klass
       .getDeclaredConstructor()
       .newInstance()
-      .asInstanceOf[AbstractRunnableSpec]
+      .asInstanceOf[ZIOSpecAbstract]
   }
 
   private var filter = Filter.ALL
@@ -55,35 +57,51 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
   lazy val getDescription: Description = {
     val description = Description.createSuiteDescription(className)
     def traverse[R, E](
-      spec: ZSpec[R, E],
+      spec: Spec[R, E],
       description: Description,
       path: Vector[String] = Vector.empty
-    ): ZManaged[R, Any, Unit] =
+    ): ZIO[R with Scope, Any, Unit] =
       spec.caseValue match {
         case Spec.ExecCase(_, spec)        => traverse(spec, description, path)
         case Spec.LabeledCase(label, spec) => traverse(spec, description, path :+ label)
-        case Spec.ManagedCase(managed)     => managed.flatMap(traverse(_, description, path))
+        case Spec.ScopedCase(scoped)       => scoped.flatMap(traverse(_, description, path))
         case Spec.MultipleCase(specs) =>
           val suiteDesc = Description.createSuiteDescription(path.lastOption.getOrElse(""), path.mkString(":"))
-          ZManaged.effectTotal(description.addChild(suiteDesc)) *>
-            ZManaged.foreach(specs)(traverse(_, suiteDesc, path)).ignore
+          ZIO.succeed(description.addChild(suiteDesc)) *>
+            ZIO.foreach(specs)(traverse(_, suiteDesc, path)).ignore
         case Spec.TestCase(_, _) =>
-          ZManaged.effectTotal(description.addChild(testDescription(path.lastOption.getOrElse(""), path)))
+          ZIO.succeed(description.addChild(testDescription(path.lastOption.getOrElse(""), path)))
       }
 
-    unsafeRun(
-      traverse(filteredSpec, description)
-        .provideLayer(spec.runner.executor.environment)
-        .useNow
-    )
+    val scoped =
+      ZIO.scoped[ZTestJUnitRunner.this.spec.Environment with zio.test.TestEnvironment](
+        traverse(filteredSpec, description)
+      )
+
+    zio.Runtime.default.unsafe
+      .run(
+        scoped
+          .provide(
+            Scope.default >>> (liveEnvironment >>> TestEnvironment.live ++ ZLayer.environment[Scope]),
+            spec.bootstrap
+          )
+      )(Trace.empty, Unsafe.unsafe)
+      .getOrThrowFiberFailure()(Unsafe.unsafe)
     description
   }
 
-  override def run(notifier: RunNotifier): Unit =
-    zio.Runtime((), spec.runner.platform).unsafeRun {
-      val instrumented = instrumentSpec(filteredSpec, new JUnitNotifier(notifier))
-      spec.runner.run(instrumented).unit.provideLayer(spec.runner.bootstrap)
-    }
+  override def run(notifier: RunNotifier): Unit = {
+    val _ = zio.Runtime.default.unsafe.run {
+
+      val instrumented: Spec[spec.Environment with TestEnvironment with Scope, Any] =
+        instrumentSpec(filteredSpec, new JUnitNotifier(notifier))
+      spec
+        .runSpecAsApp(instrumented, TestArgs.empty, Console.ConsoleLive)
+        .provide(
+          Scope.default >>> (liveEnvironment >>> TestEnvironment.live ++ ZLayer.environment[Scope] +!+ spec.bootstrap)
+        )
+    }(Trace.empty, Unsafe.unsafe).getOrThrowFiberFailure()(Unsafe.unsafe)
+  }
 
   private def reportRuntimeFailure[E](
     notifier: JUnitNotifier,
@@ -91,7 +109,7 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
     label: String,
     cause: Cause[E]
   ): UIO[Unit] = {
-    val rendered = renderToString(FailureRenderer.renderCause(cause, 0))
+    val rendered = renderToString(ConsoleRenderer.renderCause(cause, 0))
     notifier.fireTestFailure(label, path, rendered, cause.dieOption.orNull)
   }
 
@@ -107,9 +125,15 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
 
   private def renderFailureDetails(label: String, result: TestResult): Message =
     Message(
-      result.fold { result =>
-        RenderedResult(Test, label, Failed, 0, FailureRenderer.renderAssertionResult(result, 0).lines)
-      }(_ && _, _ || _, !_).rendered
+      ConsoleRenderer
+        .rendered(
+          Test,
+          label,
+          Failed,
+          0,
+          ConsoleRenderer.renderAssertionResult(result.result, 0).lines: _*
+        )
+        .streamingLines
     )
 
   private def testDescription(label: String, path: Vector[String]): Description = {
@@ -118,19 +142,19 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
   }
 
   private def instrumentSpec[R, E](
-    zspec: ZSpec[R, E],
+    zspec: Spec[R, E],
     notifier: JUnitNotifier
-  ): ZSpec[R, E] = {
-    type ZSpecCase = Spec.SpecCase[R, TestFailure[E], TestSuccess, Spec[R, TestFailure[E], TestSuccess]]
+  ): Spec[R, E] = {
+    type ZSpecCase = Spec.SpecCase[R, E, Spec[R, E]]
     def instrumentTest(label: String, path: Vector[String], test: ZIO[R, TestFailure[E], TestSuccess]) =
       notifier.fireTestStarted(label, path) *> test.tapBoth(
         {
-          case Assertion(result) => reportAssertionFailure(notifier, path, label, result)
-          case Runtime(cause)    => reportRuntimeFailure(notifier, path, label, cause)
+          case Assertion(result, _) => reportAssertionFailure(notifier, path, label, result)
+          case Runtime(cause, _)    => reportRuntimeFailure(notifier, path, label, cause)
         },
         {
           case Succeeded(_) => notifier.fireTestFinished(label, path)
-          case Ignored      => notifier.fireTestIgnored(label, path)
+          case Ignored(_)   => notifier.fireTestIgnored(label, path)
         }
       )
     def loop(specCase: ZSpecCase, path: Vector[String] = Vector.empty): ZSpecCase =
@@ -139,8 +163,10 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
           Spec.ExecCase(exec, Spec(loop(spec.caseValue, path)))
         case Spec.LabeledCase(label, spec) =>
           Spec.LabeledCase(label, Spec(loop(spec.caseValue, path :+ label)))
-        case Spec.ManagedCase(managed) =>
-          Spec.ManagedCase(managed.map(spec => Spec(loop(spec.caseValue, path))))
+        case Spec.ScopedCase(scoped) =>
+          Spec.ScopedCase[R, E, Spec[R, E]](
+            scoped.map(spec => Spec(loop(spec.caseValue, path)))
+          )
         case Spec.MultipleCase(specs) =>
           Spec.MultipleCase(specs.map(spec => Spec(loop(spec.caseValue, path))))
         case Spec.TestCase(test, annotations) =>
@@ -150,7 +176,7 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
     Spec(loop(zspec.caseValue))
   }
 
-  private def filteredSpec: ZSpec[spec.Environment, spec.Failure] =
+  private def filteredSpec =
     spec.spec
       .filterLabels(l => filter.shouldRun(testDescription(l, Vector.empty)))
       .getOrElse(spec.spec)
@@ -170,21 +196,21 @@ class ZTestJUnitRunner(klass: Class[_]) extends Runner with Filterable with Boot
       renderedText: String,
       throwable: Throwable = null
     ): UIO[Unit] =
-      effectTotal {
+      succeed {
         notifier.fireTestFailure(
           new Failure(testDescription(label, path), new TestFailed(renderedText, throwable))
         )
       }
 
-    def fireTestStarted(label: String, path: Vector[String]): UIO[Unit] = effectTotal {
+    def fireTestStarted(label: String, path: Vector[String]): UIO[Unit] = succeed {
       notifier.fireTestStarted(testDescription(label, path))
     }
 
-    def fireTestFinished(label: String, path: Vector[String]): UIO[Unit] = effectTotal {
+    def fireTestFinished(label: String, path: Vector[String]): UIO[Unit] = succeed {
       notifier.fireTestFinished(testDescription(label, path))
     }
 
-    def fireTestIgnored(label: String, path: Vector[String]): UIO[Unit] = effectTotal {
+    def fireTestIgnored(label: String, path: Vector[String]): UIO[Unit] = succeed {
       notifier.fireTestIgnored(testDescription(label, path))
     }
   }
@@ -194,4 +220,4 @@ private[junit] class TestFailed(message: String, cause: Throwable = null)
     extends Throwable(message, cause, false, false)
 
 @RunWith(classOf[ZTestJUnitRunner])
-abstract class JUnitRunnableSpec extends DefaultRunnableSpec
+abstract class JUnitRunnableSpec extends ZIOSpecDefault

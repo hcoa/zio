@@ -16,7 +16,9 @@
 
 package zio.test.sbt
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.test.Summary
+import zio.test.render.ConsoleRenderer
 
 /**
  * The ScalaJS SBT Runner uses strings to send and receive summaries. To
@@ -28,7 +30,7 @@ object SummaryProtocol {
       summary.success.toString,
       summary.fail.toString,
       summary.ignore.toString,
-      summary.summary
+      summary.failureDetails
     ).map(escape).mkString("\t")
 
   def deserialize(s: String): Option[Summary] =

@@ -17,6 +17,7 @@
 package zio
 
 import zio.NonEmptyChunk._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import scala.language.implicitConversions
 
@@ -60,10 +61,22 @@ final class NonEmptyChunk[+A] private (private val chunk: Chunk[A]) { self =>
     nonEmpty(chunk :+ a)
 
   /**
+   * Converts this `NonEmptyChunk` of ints to a `NonEmptyChunk` of bits.
+   */
+  def asBitsInt(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Int): NonEmptyChunk[Boolean] =
+    nonEmpty(chunk.asBitsInt(endianness))
+
+  /**
+   * Converts this `NonEmptyChunk` of longs to a `NonEmptyChunk` of bits.
+   */
+  def asBitsLong(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Long): NonEmptyChunk[Boolean] =
+    nonEmpty(chunk.asBitsLong(endianness))
+
+  /**
    * Converts this `NonEmptyChunk` of bytes to a `NonEmptyChunk` of bits.
    */
   def asBits(implicit ev: A <:< Byte): NonEmptyChunk[Boolean] =
-    nonEmpty(chunk.asBits)
+    nonEmpty(chunk.asBitsByte)
 
   /**
    * Returns whether this `NonEmptyChunk` and the specified `NonEmptyChunk` are
@@ -113,20 +126,22 @@ final class NonEmptyChunk[+A] private (private val chunk: Chunk[A]) { self =>
    * Effectfully maps over the elements of this `NonEmptyChunk`, maintaining
    * some state along the way.
    */
-  def mapAccumM[R, E, S, B](s: S)(f: (S, A) => ZIO[R, E, (S, B)]): ZIO[R, E, (S, NonEmptyChunk[B])] =
-    chunk.mapAccumM(s)(f).map { case (s, chunk) => (s, nonEmpty(chunk)) }
+  def mapAccumZIO[R, E, S, B](s: S)(f: (S, A) => ZIO[R, E, (S, B)])(implicit
+    trace: Trace
+  ): ZIO[R, E, (S, NonEmptyChunk[B])] =
+    chunk.mapAccumZIO(s)(f).map { case (s, chunk) => (s, nonEmpty(chunk)) }
 
   /**
    * Effectfully maps the elements of this `NonEmptyChunk`.
    */
-  def mapM[R, E, B](f: A => ZIO[R, E, B]): ZIO[R, E, NonEmptyChunk[B]] =
-    chunk.mapM(f).map(nonEmpty)
+  def mapZIO[R, E, B](f: A => ZIO[R, E, B])(implicit trace: Trace): ZIO[R, E, NonEmptyChunk[B]] =
+    chunk.mapZIO(f).map(nonEmpty)
 
   /**
    * Effectfully maps the elements of this `NonEmptyChunk` in parallel.
    */
-  def mapMPar[R, E, B](f: A => ZIO[R, E, B]): ZIO[R, E, NonEmptyChunk[B]] =
-    chunk.mapMPar(f).map(nonEmpty)
+  def mapZIOPar[R, E, B](f: A => ZIO[R, E, B])(implicit trace: Trace): ZIO[R, E, NonEmptyChunk[B]] =
+    chunk.mapZIOPar(f).map(nonEmpty)
 
   /**
    * Materialize the elements of this `NonEmptyChunk` into a `NonEmptyChunk`
@@ -153,17 +168,11 @@ final class NonEmptyChunk[+A] private (private val chunk: Chunk[A]) { self =>
    * function `reduce` to combine the `B` value with each other `A` value.
    */
   def reduceMapLeft[B](map: A => B)(reduce: (B, A) => B): B = {
-    val iterator = chunk.arrayIterator
+    val iterator = chunk.iterator
     var b: B     = null.asInstanceOf[B]
     while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
-        if (b == null) b = map(a) else b = reduce(b, a)
-        i += 1
-      }
+      val a = iterator.next()
+      if (b == null) b = map(a) else b = reduce(b, a)
     }
     b
   }
@@ -174,17 +183,11 @@ final class NonEmptyChunk[+A] private (private val chunk: Chunk[A]) { self =>
    * function `reduce` to combine the `B` value with each other `A` value.
    */
   def reduceMapRight[B](map: A => B)(reduce: (A, B) => B): B = {
-    val iterator = chunk.reverseArrayIterator
+    val iterator = chunk.reverseIterator
     var b: B     = null.asInstanceOf[B]
     while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = length - 1
-      while (i >= 0) {
-        val a = array(i)
-        if (b == null) b = map(a) else b = reduce(a, b)
-        i -= 1
-      }
+      val a = iterator.next()
+      if (b == null) b = map(a) else b = reduce(a, b)
     }
     b
   }
@@ -212,8 +215,8 @@ final class NonEmptyChunk[+A] private (private val chunk: Chunk[A]) { self =>
    * Zips this `NonEmptyChunk` with the specified `NonEmptyChunk`, only keeping
    * as many elements as are in the smaller chunk.
    */
-  def zip[B](that: NonEmptyChunk[B]): NonEmptyChunk[(A, B)] =
-    zipWith(that)((_, _))
+  def zip[B](that: NonEmptyChunk[B])(implicit zippable: Zippable[A, B]): NonEmptyChunk[zippable.Out] =
+    zipWith(that)(zippable.zip(_, _))
 
   /**
    * Zips this `NonEmptyChunk` with the specified `Chunk`, using `None` to "fill

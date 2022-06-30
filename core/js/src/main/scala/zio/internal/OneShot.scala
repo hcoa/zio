@@ -16,6 +16,8 @@
 
 package zio.internal
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 /**
  * A variable that can be set a single time. The synchronous, effectful
  * equivalent of `Promise`.
@@ -46,7 +48,7 @@ private[zio] final class OneShot[A] private (var value: A) {
   }
 }
 
-object OneShot {
+private[zio] object OneShot {
 
   /**
    * Makes a new (unset) variable.

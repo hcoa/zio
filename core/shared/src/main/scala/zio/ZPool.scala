@@ -1,39 +1,45 @@
+/*
+ * Copyright 2021-2022 John A. De Goes and the ZIO Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package zio
 
-import zio.clock.Clock
-import zio.duration.Duration
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * A `ZPool[E, A]` is a pool of items of type `A`, each of which may be
  * associated with the acquisition and release of resources. An attempt to get
  * an item `A` from a pool may fail with an error of type `E`.
  */
-trait ZPool[+E, Item] {
+trait ZPool[+Error, Item] {
 
   /**
-   * Retrieves an item from the pool in a `Managed` effect. Note that if
+   * Retrieves an item from the pool in a scoped effect. Note that if
    * acquisition fails, then the returned effect will fail for that same reason.
    * Retrying a failed acquisition attempt will repeat the acquisition attempt.
    */
-  def get: ZManaged[Any, E, Item]
+  def get(implicit trace: Trace): ZIO[Scope, Error, Item]
 
   /**
    * Invalidates the specified item. This will cause the pool to eventually
    * reallocate the item, although this reallocation may occur lazily rather
    * than eagerly.
    */
-  def invalidate(item: Item): UIO[Unit]
+  def invalidate(item: Item)(implicit trace: Trace): UIO[Unit]
 }
 object ZPool {
-
-  implicit private class ZioOps[-R, +E, +A](private val self: ZIO[R, E, A]) extends AnyVal {
-    final def exit: URIO[R, Exit[E, A]] =
-      new ZIO.Fold[R, E, Nothing, A, Exit[E, A]](
-        self,
-        cause => ZIO.succeedNow(Exit.halt(cause)),
-        success => ZIO.succeedNow(Exit.succeed(success))
-      )
-  }
 
   /**
    * Creates a pool from a fixed number of pre-allocated items. This method
@@ -41,79 +47,93 @@ object ZPool {
    * associated with items in the pool. If cleanup or release is required, then
    * the `make` constructor should be used instead.
    */
-  def fromIterable[A](iterable: => Iterable[A]): UManaged[ZPool[Nothing, A]] =
+  def fromIterable[A](iterable: => Iterable[A])(implicit trace: Trace): ZIO[Scope, Nothing, ZPool[Nothing, A]] =
     for {
-      iterable <- ZManaged.succeed(iterable)
-      source   <- Ref.make(iterable.toList).toManaged_
+      iterable <- ZIO.succeed(iterable)
+      source   <- Ref.make(iterable.toList)
       get = if (iterable.isEmpty) ZIO.never
             else
               source.modify {
                 case head :: tail => (head, tail)
                 case Nil          => throw new IllegalArgumentException("No items in list!")
               }
-      pool <- ZPool.make(ZManaged.fromEffect(get), iterable.size)
+      pool <- ZPool.make(get, iterable.size)
     } yield pool
 
   /**
    * Makes a new pool of the specified fixed size. The pool is returned in a
-   * `Managed`, which governs the lifetime of the pool. When the pool is
-   * shutdown because the `Managed` is used, the individual items allocated by
-   * the pool will be released in some unspecified order.
+   * `Scope`, which governs the lifetime of the pool. When the pool is shutdown
+   * because the `Scope` is closed, the individual items allocated by the pool
+   * will be released in some unspecified order.
    */
-  def make[R, E, A](get: ZManaged[R, E, A], size: => Int): URManaged[R, ZPool[E, A]] =
+  def make[R, E, A](get: => ZIO[R, E, A], size: => Int)(implicit
+    trace: Trace
+  ): ZIO[R with Scope, Nothing, ZPool[E, A]] =
     for {
-      size <- ZManaged.succeed(size)
+      size <- ZIO.succeed(size)
       pool <- makeWith(get, size to size)(Strategy.None)
     } yield pool
 
   /**
    * Makes a new pool with the specified minimum and maximum sizes and time to
    * live before a pool whose excess items are not being used will be shrunk
-   * down to the minimum size. The pool is returned in a `Managed`, which
-   * governs the lifetime of the pool. When the pool is shutdown because the
-   * `Managed` is used, the individual items allocated by the pool will be
-   * released in some unspecified order.
+   * down to the minimum size. The pool is returned in a `Scope`, which governs
+   * the lifetime of the pool. When the pool is shutdown because the `Scope` is
+   * used, the individual items allocated by the pool will be released in some
+   * unspecified order.
    * {{{
-   * ZPool.make(acquireDbConnection, 10 to 20, 60.seconds).use { pool =>
-   *   pool.get.use {
-   *     connection => useConnection(connection)
+   * ZIO.scoped {
+   *   ZPool.make(acquireDbConnection, 10 to 20, 60.seconds).flatMap { pool =>
+   *     ZIO.scoped {
+   *       pool.get.flatMap {
+   *         connection => useConnection(connection)
+   *       }
+   *     }
    *   }
    * }
    * }}}
    */
-  def make[R, E, A](
-    get: ZManaged[R, E, A],
-    range: => Range,
-    timeToLive: => Duration
-  ): ZManaged[R with Clock, Nothing, ZPool[E, A]] =
-    makeWith(get, range)(Strategy.TimeToLive(timeToLive))
+  def make[R, E, A](get: => ZIO[R, E, A], range: => Range, timeToLive: => Duration)(implicit
+    trace: Trace
+  ): ZIO[R with Scope, Nothing, ZPool[E, A]] =
+    makeWith[R, Any, E, A](get, range)(Strategy.TimeToLive(timeToLive))
 
   /**
    * A more powerful variant of `make` that allows specifying a `Strategy` that
    * describes how a pool whose excess items are not being used will be shrunk
    * down to the minimum size.
    */
-  private def makeWith[R, R1, E, A](get: ZManaged[R, E, A], range: => Range)(
-    strategy: => Strategy[R1, E, A]
-  ): ZManaged[R with R1, Nothing, ZPool[E, A]] =
-    for {
-      get      <- ZManaged.succeed(get)
-      range    <- ZManaged.succeed(range)
-      strategy <- ZManaged.succeed(strategy)
-      env      <- ZManaged.environment[R]
-      down     <- Ref.make(false).toManaged_
-      state    <- Ref.make(State(0, 0)).toManaged_
-      items    <- Queue.bounded[Attempted[E, A]](range.end).toManaged_
-      inv      <- Ref.make(Set.empty[A]).toManaged_
-      initial  <- strategy.initial.toManaged_
-      pool      = DefaultPool(get.provide(env), range, down, state, items, inv, strategy.track(initial))
-      fiber    <- pool.initialize.forkDaemon.toManaged_
-      shrink   <- strategy.run(initial, pool.excess, pool.shrink).forkDaemon.toManaged_
-      _        <- ZManaged.finalizer(fiber.interrupt *> shrink.interrupt *> pool.shutdown)
-    } yield pool
+  private def makeWith[R, R1, E, A](get: => ZIO[R, E, A], range: => Range)(strategy: => Strategy[R1, E, A])(implicit
+    trace: Trace
+  ): ZIO[R with R1 with Scope, Nothing, ZPool[E, A]] =
+    ZIO.uninterruptibleMask { restore =>
+      for {
+        get      <- ZIO.succeed(get)
+        range    <- ZIO.succeed(range)
+        strategy <- ZIO.succeed(strategy)
+        env      <- ZIO.environment[R]
+        down     <- Ref.make(false)
+        state    <- Ref.make(State(0, 0))
+        items    <- Queue.bounded[Attempted[E, A]](range.end)
+        inv      <- Ref.make(Set.empty[A])
+        initial  <- strategy.initial
+        pool = DefaultPool(
+                 get.provideSomeEnvironment[Scope](env.union[Scope](_)),
+                 range,
+                 down,
+                 state,
+                 items,
+                 inv,
+                 strategy.track(initial)
+               )
+        fiber  <- restore(pool.initialize).forkDaemon
+        shrink <- restore(strategy.run(initial, pool.excess, pool.shrink)).forkDaemon
+        _      <- ZIO.addFinalizer(fiber.interrupt *> shrink.interrupt *> pool.shutdown)
+      } yield pool
+    }
 
   private case class Attempted[+E, +A](result: Exit[E, A], finalizer: UIO[Any]) {
-    def isFailure: Boolean = !result.succeeded
+    def isFailure: Boolean = result.isFailure
 
     def forEach[R, E2](f: A => ZIO[R, E2, Any]): ZIO[R, E2, Any] =
       result match {
@@ -121,12 +141,12 @@ object ZPool {
         case Exit.Success(a) => f(a)
       }
 
-    def toManaged: ZManaged[Any, E, A] =
-      ZIO.done(result).toManaged_
+    def toZIO(implicit trace: Trace): ZIO[Any, E, A] =
+      ZIO.done(result)
   }
 
   private case class DefaultPool[R, E, A, S](
-    creator: ZManaged[Any, E, A],
+    creator: ZIO[Scope, E, A],
     range: Range,
     isShuttingDown: Ref[Boolean],
     state: Ref[State],
@@ -138,10 +158,10 @@ object ZPool {
     /**
      * Returns the number of items in the pool in excess of the minimum size.
      */
-    def excess: UIO[Int] =
+    def excess(implicit trace: Trace): UIO[Int] =
       state.get.map { case State(free, size) => size - range.start min free }
 
-    override def get: ZManaged[Any, E, A] = {
+    def get(implicit trace: Trace): ZIO[Scope, E, A] = {
 
       def acquire: UIO[Attempted[E, A]] =
         isShuttingDown.get.flatMap { down =>
@@ -150,19 +170,15 @@ object ZPool {
             state.modify { case State(size, free) =>
               if (free > 0 || size >= range.end)
                 (
-                  items.take.flatMap { acquired =>
-                    acquired.result match {
+                  items.take.flatMap { attempted =>
+                    attempted.result match {
                       case Exit.Success(item) =>
                         invalidated.get.flatMap { set =>
-                          if (set.contains(item))
-                            state.update(state => state.copy(free = state.free + 1)) *>
-                              allocate *>
-                              acquire
-                          else
-                            ZIO.succeedNow(acquired)
+                          if (set.contains(item)) finalizeInvalid(attempted) *> acquire
+                          else ZIO.succeedNow(attempted)
                         }
                       case _ =>
-                        ZIO.succeedNow(acquired)
+                        ZIO.succeedNow(attempted)
                     }
                   },
                   State(size, free - 1)
@@ -175,38 +191,50 @@ object ZPool {
         }
 
       def release(attempted: Attempted[E, A]): UIO[Any] =
-        if (attempted.isFailure)
-          state.modify { case State(size, free) =>
-            if (size <= range.start)
-              allocate -> State(size, free + 1)
-            else
-              ZIO.unit -> State(size - 1, free)
-          }.flatten
-        else
-          state.update(state => state.copy(free = state.free + 1)) *>
-            items.offer(attempted) *>
-            track(attempted.result) *>
-            getAndShutdown.whenM(isShuttingDown.get)
+        attempted.result match {
+          case Exit.Success(item) =>
+            invalidated.get.flatMap { set =>
+              if (set.contains(item)) finalizeInvalid(attempted)
+              else
+                state.update(state => state.copy(free = state.free + 1)) *>
+                  items.offer(attempted) *>
+                  track(attempted.result) *>
+                  getAndShutdown.whenZIO(isShuttingDown.get)
+            }
 
-      ZManaged.make(acquire)(release(_)).flatMap(_.toManaged)
+          case Exit.Failure(_) =>
+            state.modify { case State(size, free) =>
+              if (size <= range.start)
+                allocate -> State(size, free + 1)
+              else
+                ZIO.unit -> State(size - 1, free)
+            }.flatten
+        }
+
+      for {
+        releaseAndAttempted <- ZIO.acquireRelease(acquire)(release(_)).withEarlyRelease
+        (release, attempted) = releaseAndAttempted
+        _                   <- release.when(attempted.isFailure)
+        item                <- attempted.toZIO.disconnect
+      } yield item
     }
 
     /**
      * Begins pre-allocating pool entries based on minimum pool size.
      */
-    final def initialize: UIO[Unit] =
-      ZIO.replicateM_(range.start) {
+    final def initialize(implicit trace: Trace): UIO[Unit] =
+      ZIO.replicateZIODiscard(range.start) {
         ZIO.uninterruptibleMask { restore =>
           state.modify { case State(size, free) =>
             if (size < range.start && size >= 0)
               (
                 for {
-                  reservation <- creator.reserve
-                  exit        <- restore(reservation.acquire).exit
-                  attempted   <- ZIO.succeed(Attempted(exit, reservation.release(Exit.succeed(()))))
-                  _           <- items.offer(attempted)
-                  _           <- track(attempted.result)
-                  _           <- getAndShutdown.whenM(isShuttingDown.get)
+                  scope     <- Scope.make
+                  exit      <- restore(scope.extend(creator)).exit
+                  attempted <- ZIO.succeed(Attempted(exit, scope.close(Exit.succeed(()))))
+                  _         <- items.offer(attempted)
+                  _         <- track(attempted.result)
+                  _         <- getAndShutdown.whenZIO(isShuttingDown.get)
                 } yield attempted,
                 State(size + 1, free + 1)
               )
@@ -216,13 +244,23 @@ object ZPool {
         }
       }
 
-    override def invalidate(item: A): UIO[Unit] =
+    def invalidate(item: A)(implicit trace: zio.Trace): UIO[Unit] =
       invalidated.update(_ + item)
+
+    private def finalizeInvalid(attempted: Attempted[E, A])(implicit trace: zio.Trace): UIO[Any] =
+      attempted.forEach(a => invalidated.update(_ - a)) *>
+        attempted.finalizer *>
+        state.modify { case State(size, free) =>
+          if (size <= range.start)
+            allocate -> State(size, free + 1)
+          else
+            ZIO.unit -> State(size - 1, free)
+        }.flatten
 
     /**
      * Shrinks the pool down, but never to less than the minimum size.
      */
-    def shrink: UIO[Any] =
+    def shrink(implicit trace: Trace): UIO[Any] =
       ZIO.uninterruptible {
         state.modify { case State(size, free) =>
           if (size > range.start && free > 0)
@@ -239,15 +277,15 @@ object ZPool {
         }.flatten
       }
 
-    private def allocate: UIO[Any] =
+    private def allocate(implicit trace: Trace): UIO[Any] =
       ZIO.uninterruptibleMask { restore =>
         for {
-          reservation <- creator.reserve
-          exit        <- restore(reservation.acquire).exit
-          attempted   <- ZIO.succeed(Attempted(exit, reservation.release(Exit.succeed(()))))
-          _           <- items.offer(attempted)
-          _           <- track(attempted.result)
-          _           <- getAndShutdown.whenM(isShuttingDown.get)
+          scope     <- Scope.make
+          exit      <- restore(scope.extend(creator)).exit
+          attempted <- ZIO.succeed(Attempted(exit, scope.close(Exit.succeed(()))))
+          _         <- items.offer(attempted)
+          _         <- track(attempted.result)
+          _         <- getAndShutdown.whenZIO(isShuttingDown.get)
         } yield attempted
       }
 
@@ -255,11 +293,11 @@ object ZPool {
      * Gets items from the pool and shuts them down as long as there are items
      * free, signalling shutdown of the pool if the pool is empty.
      */
-    private def getAndShutdown: UIO[Unit] =
+    private def getAndShutdown(implicit trace: Trace): UIO[Unit] =
       state.modify { case State(size, free) =>
         if (free > 0)
           (
-            items.take.foldCauseM(
+            items.take.foldCauseZIO(
               _ => ZIO.unit,
               attempted =>
                 attempted.forEach(a => invalidated.update(_ - a)) *>
@@ -275,7 +313,7 @@ object ZPool {
           items.shutdown -> State(size - 1, free)
       }.flatten
 
-    final def shutdown: UIO[Unit] =
+    final def shutdown(implicit trace: Trace): UIO[Unit] =
       isShuttingDown.modify { down =>
         if (down)
           items.awaitShutdown -> true
@@ -290,7 +328,7 @@ object ZPool {
    * A `Strategy` describes the protocol for how a pool whose excess items are
    * not being used should shrink down to the minimum pool size.
    */
-  private trait Strategy[-Environment, -E, -Item] {
+  private trait Strategy[-Environment, -Error, -Item] {
 
     /**
      * Describes the type of the state maintained by the strategy.
@@ -300,18 +338,18 @@ object ZPool {
     /**
      * Describes how the initial state of the strategy should be allocated.
      */
-    def initial: URIO[Environment, State]
+    def initial(implicit trace: Trace): URIO[Environment, State]
 
     /**
      * Describes how the state of the strategy should be updated when an item is
      * added to the pool or returned to the pool.
      */
-    def track(state: State)(item: Exit[E, Item]): UIO[Unit]
+    def track(state: State)(item: Exit[Error, Item])(implicit trace: Trace): UIO[Unit]
 
     /**
      * Describes how excess items that are not being used should shrink down.
      */
-    def run(state: State, getExcess: UIO[Int], shrink: UIO[Any]): UIO[Unit]
+    def run(state: State, getExcess: UIO[Int], shrink: UIO[Any])(implicit trace: Trace): UIO[Unit]
   }
 
   private object Strategy {
@@ -322,12 +360,12 @@ object ZPool {
      * nothing to do.
      */
     case object None extends Strategy[Any, Any, Any] {
-      type State = Unit
-      override def initial: URIO[Any, Unit] =
+      type State = Any
+      def initial(implicit trace: Trace): UIO[Any] =
         ZIO.unit
-      override def track(state: Unit)(attempted: Exit[Any, Any]): UIO[Unit] =
+      def track(state: Any)(attempted: Exit[Any, Any])(implicit trace: Trace): UIO[Unit] =
         ZIO.unit
-      override def run(state: Unit, getExcess: UIO[Int], shrink: UIO[Any]): UIO[Unit] =
+      def run(state: Any, getExcess: UIO[Int], shrink: UIO[Any])(implicit trace: Trace): UIO[Unit] =
         ZIO.unit
     }
 
@@ -335,38 +373,33 @@ object ZPool {
      * A strategy that shrinks the pool down to its minimum size if items in the
      * pool have not been used for the specified duration.
      */
-    final case class TimeToLive(timeToLive: Duration) extends Strategy[Clock, Any, Any] {
-      type State = (Clock.Service, Ref[java.time.Instant])
-
-      override def initial: URIO[Clock, State] =
+    final case class TimeToLive(timeToLive: Duration) extends Strategy[Any, Any, Any] {
+      type State = (Clock, Ref[java.time.Instant])
+      def initial(implicit trace: Trace): UIO[State] =
         for {
-          clock <- ZIO.service[Clock.Service]
-          now   <- clock.instant
+          clock <- ZIO.clock
+          now   <- Clock.instant
           ref   <- Ref.make(now)
         } yield (clock, ref)
-
-      override def track(state: (Clock.Service, Ref[java.time.Instant]))(attempted: Exit[Any, Any]): UIO[Unit] = {
+      def track(state: (Clock, Ref[java.time.Instant]))(attempted: Exit[Any, Any])(implicit
+        trace: Trace
+      ): UIO[Unit] = {
         val (clock, ref) = state
         for {
           now <- clock.instant
           _   <- ref.set(now)
         } yield ()
       }
-
-      override def run(
-        state: (Clock.Service, Ref[java.time.Instant]),
-        getExcess: UIO[Int],
-        shrink: UIO[Any]
+      def run(state: (Clock, Ref[java.time.Instant]), getExcess: UIO[Int], shrink: UIO[Any])(implicit
+        trace: Trace
       ): UIO[Unit] = {
-        import duration._
-
         val (clock, ref) = state
         getExcess.flatMap { excess =>
           if (excess <= 0)
             clock.sleep(timeToLive) *> run(state, getExcess, shrink)
           else
             ref.get.zip(clock.instant).flatMap { case (start, end) =>
-              val duration: Duration = java.time.Duration.between(start, end)
+              val duration = java.time.Duration.between(start, end)
               if (duration >= timeToLive) shrink *> run(state, getExcess, shrink)
               else clock.sleep(timeToLive) *> run(state, getExcess, shrink)
             }

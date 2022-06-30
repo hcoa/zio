@@ -1,6 +1,5 @@
 package zio
 
-import zio.internal.Executor
 import zio.test.Assertion._
 import zio.test.TestAspect._
 import zio.test._
@@ -12,25 +11,28 @@ object CancelableFutureSpecJVM extends ZIOBaseSpec {
 
   import ZIOTag._
 
-  def spec: ZSpec[ZTestEnv with Annotations with TestConfig, Any] =
+  def spec =
     suite("CancelableFutureSpecJVM")(
-      testM("fromFuture/unsafeRunToFuture doesn't deadlock") {
+      test("fromFuture/unsafeRunToFuture doesn't deadlock") {
 
         val tst =
           for {
             runtime <- ZIO.runtime[Any]
-            r       <- ZIO.fromFuture(_ => runtime.unsafeRunToFuture(UIO.succeedNow(0)))
+            r <- ZIO.fromFuture { _ =>
+                   Unsafe.unsafe { implicit unsafe =>
+                     runtime.unsafe.runToFuture(ZIO.succeedNow(0))
+                   }
+                 }
           } yield assert(r)(equalTo(0))
+
+        val executor = Executor.fromExecutionContext(
+          ExecutionContext.fromExecutor(Executors.newSingleThreadScheduledExecutor())
+        )
+
         ZIO
           .runtime[Any]
-          .map(
-            _.mapPlatform(
-              _.withExecutor(
-                Executor.fromExecutionContext(1)(
-                  ExecutionContext.fromExecutor(Executors.newSingleThreadScheduledExecutor())
-                )
-              )
-            ).unsafeRun(tst)
+          .map(runtime =>
+            Unsafe.unsafe(implicit unsafe => runtime.unsafe.run(tst.onExecutor(executor)).getOrThrowFiberFailure())
           )
       } @@ nonFlaky
     ) @@ zioTag(future)

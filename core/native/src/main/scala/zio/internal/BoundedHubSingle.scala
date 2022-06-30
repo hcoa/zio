@@ -17,6 +17,7 @@
 package zio.internal
 
 import zio.Chunk
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * A bounded hub with capacity equal to one backed by an atomic reference.
@@ -47,7 +48,7 @@ private final class BoundedHubSingle[A] extends Hub[A] {
       true
     }
 
-  def publishAll(as: Iterable[A]): Chunk[A] =
+  def publishAll[A1 <: A](as: Iterable[A1]): Chunk[A1] =
     if (as.isEmpty) Chunk.empty
     else {
       val a = as.head

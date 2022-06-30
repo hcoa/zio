@@ -5,7 +5,7 @@ import zio.test._
 object LawsFSpec extends ZIOBaseSpec {
 
   def equalTo[A: Equal](expected: A): Assertion[A] =
-    Assertion.assertion("equalTo")(Assertion.Render.param(expected))(_ === expected)
+    Assertion.assertion("equalTo")(_ === expected)
 
   implicit class AssertEqualToSyntax[A](private val self: A) extends AnyVal {
     def <->(that: A)(implicit eq: Equal[A]): TestResult =
@@ -109,10 +109,10 @@ object LawsFSpec extends ZIOBaseSpec {
       }
   }
 
-  def spec: ZSpec[Environment, Failure] = suite("LawsFSpec")(
+  def spec = suite("LawsFSpec")(
     suite("covariantLaws")(
-      testM("option") {
-        checkAllLaws(Covariant)(GenF.option, Gen.anyInt)
+      test("option") {
+        checkAllLaws(Covariant)(GenF.option, Gen.int)
       }
     )
   )

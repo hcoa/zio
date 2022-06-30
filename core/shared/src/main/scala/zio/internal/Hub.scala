@@ -17,6 +17,7 @@
 package zio.internal
 
 import zio.Chunk
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * A `Hub[A]` is a concurrent data structure that allows multiple publishers to
@@ -24,7 +25,7 @@ import zio.Chunk
  * guarantee that all subscribers will receive all values published to the hub
  * while they are subscribed.
  */
-abstract class Hub[A] extends Serializable {
+private[zio] abstract class Hub[A] extends Serializable {
 
   /**
    * The maximum capacity of the hub.
@@ -51,7 +52,7 @@ abstract class Hub[A] extends Serializable {
    * Publishes the specified values to the hub, returning the values that could
    * not be successfully published to the hub.
    */
-  def publishAll(as: Iterable[A]): Chunk[A]
+  def publishAll[A1 <: A](as: Iterable[A1]): Chunk[A1]
 
   /**
    * The current number of values in the hub.
@@ -69,7 +70,7 @@ abstract class Hub[A] extends Serializable {
   def subscribe(): Hub.Subscription[A]
 }
 
-object Hub {
+private[zio] object Hub {
 
   /**
    * Constructs a new bounded hub with the requested capacity.
@@ -92,7 +93,7 @@ object Hub {
    * The guarantee is that a subscriber will receive all values published to hub
    * while it is subscribed.
    */
-  abstract class Subscription[A] extends Serializable {
+  private[zio] abstract class Subscription[A] extends Serializable {
 
     /**
      * Checks whether there are values available to take from the hub.

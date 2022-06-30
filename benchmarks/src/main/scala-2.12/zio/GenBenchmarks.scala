@@ -1,13 +1,14 @@
 package zio
 
-import org.openjdk.jmh.annotations._
+import org.openjdk.jmh.annotations.{Scope => JScope, _}
 import org.scalacheck
-import zio.IOBenchmarks.unsafeRun
+
+import zio.BenchmarkUtil.unsafeRun
 import zio.test.Gen
 
 import java.util.concurrent.TimeUnit
 
-@State(Scope.Thread)
+@State(JScope.Thread)
 @BenchmarkMode(Array(Mode.AverageTime))
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
 class GenBenchmarks {
@@ -19,30 +20,30 @@ class GenBenchmarks {
   var elementSize: Int = _
   @Benchmark
   def zioDouble: List[Double] =
-    unsafeRun(Gen.listOfN(listSize)(Gen.uniform).sample.map(_.value).runHead.get.provideLayer(ZEnv.live))
+    unsafeRun(Gen.listOfN(listSize)(Gen.uniform).sample.collectSome.map(_.value).runHead.some)
 
   @Benchmark
   def zioIntListsOfSizeN: List[List[Int]] =
     unsafeRun(
       Gen
-        .listOfN(listSize)(Gen.listOfN(elementSize)(Gen.anyInt))
+        .listOfN(listSize)(Gen.listOfN(elementSize)(Gen.int))
         .sample
+        .collectSome
         .map(_.value)
         .runHead
-        .get
-        .provideLayer(ZEnv.live)
+        .some
     )
 
   @Benchmark
   def zioStringsOfSizeN: List[String] =
     unsafeRun(
       Gen
-        .listOfN(listSize)(Gen.stringN(elementSize)(Gen.anyChar))
+        .listOfN(listSize)(Gen.stringN(elementSize)(Gen.char))
         .sample
+        .collectSome
         .map(_.value)
         .runHead
-        .get
-        .provideLayer(ZEnv.live)
+        .some
     )
 
   @Benchmark

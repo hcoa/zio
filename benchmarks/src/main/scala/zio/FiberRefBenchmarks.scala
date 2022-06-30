@@ -8,16 +8,16 @@ import org.openjdk.jmh.annotations.{
   Mode,
   OutputTimeUnit,
   Param,
-  Scope,
+  Scope => JScope,
   State,
   Threads,
   Warmup
 }
-import zio.IOBenchmarks.verify
+import zio.BenchmarkUtil.verify
 
 import java.util.concurrent.TimeUnit
 
-@State(Scope.Thread)
+@State(JScope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Warmup(iterations = 5, time = 1, timeUnit = TimeUnit.SECONDS)
@@ -28,45 +28,155 @@ class FiberRefBenchmarks {
   @Param(Array("32"))
   var n: Int = _
 
-  @Benchmark
-  def tracedCreateUpdateAndRead(): Unit =
-    createUpdateAndRead(IOBenchmarks.TracedRuntime)
+  @Param(Array("10000"))
+  var m: Int = _
 
   @Benchmark
-  def unTracedCreateUpdateAndRead(): Unit =
-    createUpdateAndRead(IOBenchmarks)
+  def createUpdateAndRead(): Unit =
+    createUpdateAndRead(BenchmarkUtil)
 
   @Benchmark
-  def unTracedJustYield(): Unit =
-    justYield(IOBenchmarks)
+  def justYield(): Unit =
+    justYield(BenchmarkUtil)
 
   @Benchmark
-  def unTracedCreateFiberRefsAndYield(): Unit =
-    createFiberRefsAndYield(IOBenchmarks)
+  def createFiberRefsAndYield(): Unit =
+    createFiberRefsAndYield(BenchmarkUtil)
 
-  private def justYield(runtime: Runtime[Any]) = runtime.unsafeRun {
-    for {
-      _ <- ZIO.foreach_(1.to(n))(_ => ZIO.yieldNow)
-    } yield ()
-  }
+  @Benchmark
+  def createAndJoin(): Unit =
+    createAndJoin(BenchmarkUtil)
 
-  private def createFiberRefsAndYield(runtime: Runtime[Any]) = runtime.unsafeRun {
-    for {
-      fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.make(i))
-      _         <- ZIO.foreach_(1.to(n))(_ => ZIO.yieldNow)
-      values    <- ZIO.foreachPar(fiberRefs)(_.get)
-      _         <- verify(values == 1.to(n))(s"Got $values")
-    } yield ()
-  }
+  @Benchmark
+  def createAndJoinExpensive(): Unit =
+    createAndJoinExpensive(BenchmarkUtil)
 
-  private def createUpdateAndRead(runtime: Runtime[Any]) = runtime.unsafeRun {
-    for {
-      fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.make(i))
-      values1   <- ZIO.foreachPar(fiberRefs)(ref => ref.update(-_) *> ref.get)
-      values2   <- ZIO.foreachPar(fiberRefs)(_.get)
-      _ <- verify(values1.forall(_ < 0) && values1.size == values2.size)(
-             s"Got \nvalues1: $values1, \nvalues2: $values2"
-           )
-    } yield ()
+  @Benchmark
+  def createAndJoinInitialValue(): Unit =
+    createAndJoinInitialValue(BenchmarkUtil)
+
+  @Benchmark
+  def createAndJoinUpdatesWide(): Unit =
+    createAndJoinUpdatesWide(BenchmarkUtil)
+
+  @Benchmark
+  def createAndJoinUpdatesDeep(): Unit =
+    createAndJoinUpdatesDeep(BenchmarkUtil)
+
+  private def justYield(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        for {
+          _ <- ZIO.foreachDiscard(1.to(n))(_ => ZIO.yieldNow)
+        } yield ()
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createFiberRefsAndYield(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.make(i))
+            _         <- ZIO.foreachDiscard(1.to(n))(_ => ZIO.yieldNow)
+            values    <- ZIO.foreachPar(fiberRefs)(_.get)
+            _         <- verify(values == 1.to(n))(s"Got $values")
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createUpdateAndRead(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.make(i))
+            values1   <- ZIO.foreachPar(fiberRefs)(ref => ref.update(-_) *> ref.get)
+            values2   <- ZIO.foreachPar(fiberRefs)(_.get)
+            _ <- verify(values1.forall(_ < 0) && values1.size == values2.size)(
+                   s"Got \nvalues1: $values1, \nvalues2: $values2"
+                 )
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createAndJoin(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.makePatch(i, addDiffer, 0))
+            _         <- ZIO.foreachDiscard(fiberRefs)(_.update(_ + 1))
+            _         <- ZIO.collectAllParDiscard(List.fill(m)(ZIO.unit))
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createAndJoinExpensive(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.makeSet(1.to(i).toSet))
+            _         <- ZIO.foreachDiscard(fiberRefs)(_.update(_.map(_ + 1)))
+            _         <- ZIO.collectAllParDiscard(List.fill(m)(ZIO.unit))
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createAndJoinInitialValue(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            _ <- ZIO.foreach(1.to(n))(i => FiberRef.makePatch(i, addDiffer, 0))
+            _ <- ZIO.collectAllParDiscard(List.fill(m)(ZIO.unit))
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createAndJoinUpdatesWide(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          for {
+            fiberRefs <- ZIO.foreach(1.to(n))(i => FiberRef.makePatch(i, addDiffer, 0))
+            _         <- ZIO.foreachDiscard(fiberRefs)(_.update(_ + 1))
+            _         <- ZIO.collectAllParDiscard(List.fill(m)(ZIO.foreachDiscard(fiberRefs)(_.update(_ + 1))))
+          } yield ()
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private def createAndJoinUpdatesDeep(runtime: Runtime[Any]) =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        ZIO.scoped {
+          ZIO.foreach(1.to(n))(i => FiberRef.makePatch(i, addDiffer, 0)).flatMap { fiberRefs =>
+            def go(depth: Int): UIO[Unit] =
+              if (depth <= 0) ZIO.unit
+              else
+                for {
+                  _  <- ZIO.foreachDiscard(fiberRefs)(_.update(_ + 1))
+                  f1 <- go(depth - 1).fork
+                  _  <- f1.join
+                } yield ()
+
+            go(m)
+          }
+        }
+      }.getOrThrowFiberFailure()
+    }
+
+  private val addDiffer = new Differ[Int, Int] {
+    def combine(first: Int, second: Int): Int   = first + second
+    def diff(oldValue: Int, newValue: Int): Int = newValue - oldValue
+    def empty: Int                              = 0
+    def patch(patch: Int)(oldValue: Int): Int   = oldValue + patch
   }
 }

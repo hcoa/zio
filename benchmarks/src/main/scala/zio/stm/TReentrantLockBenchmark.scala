@@ -1,14 +1,14 @@
 package zio.stm
 
-import org.openjdk.jmh.annotations.{Benchmark, Group, GroupThreads, _}
+import org.openjdk.jmh.annotations.{Benchmark, Group, GroupThreads, Scope => JScope, _}
 import org.openjdk.jmh.infra.Blackhole
-import zio.IOBenchmarks._
+import zio.BenchmarkUtil._
 import zio._
 
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.StampedLock
 
-@State(Scope.Group)
+@State(JScope.Group)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Measurement(iterations = 10, timeUnit = TimeUnit.SECONDS, time = 10)
@@ -104,7 +104,7 @@ class TReentrantLockBenchmark {
   def zioLockRead(): Unit = {
     val io = for {
       lock <- zioLock
-      _    <- lock.readLock.use(_ => doWorkM())
+      _    <- ZIO.scoped(lock.readLock *> doWorkZIO())
     } yield ()
 
     unsafeRun(io)
@@ -114,7 +114,7 @@ class TReentrantLockBenchmark {
   def zioLockWrite(): Unit = {
     val io = for {
       lock <- zioLock
-      _    <- lock.writeLock.use(_ => doWorkM())
+      _    <- ZIO.scoped(lock.writeLock.flatMap(_ => doWorkZIO()))
     } yield ()
 
     unsafeRun(io)
@@ -141,7 +141,7 @@ class TReentrantLockBenchmark {
   }
 
   @CompilerControl(CompilerControl.Mode.DONT_INLINE)
-  def doWorkM(): UIO[Unit] = ZIO.effectTotal(doWork())
+  def doWorkZIO(): UIO[Unit] = ZIO.succeed(doWork())
 
   @CompilerControl(CompilerControl.Mode.DONT_INLINE)
   def doWork(): Unit = Blackhole.consumeCPU(100L)

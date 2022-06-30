@@ -16,9 +16,7 @@
 
 package zio.test
 
-import zio.duration._
-import zio.test.environment.Live
-import zio.{URIO, ZIO, console}
+import zio._
 
 trait TimeoutVariants {
 
@@ -28,16 +26,16 @@ trait TimeoutVariants {
    */
   def timeoutWarning(
     duration: Duration
-  ): TestAspect[Nothing, Live, Nothing, Any] =
+  ): TestAspectAtLeastR[Live] =
     new TestAspect[Nothing, Live, Nothing, Any] {
       def some[R <: Live, E](
-        spec: ZSpec[R, E]
-      ): ZSpec[R, E] = {
-        def loop(labels: List[String], spec: ZSpec[R, E]): ZSpec[R with Live, E] =
+        spec: Spec[R, E]
+      )(implicit trace: Trace): Spec[R, E] = {
+        def loop(labels: List[String], spec: Spec[R, E]): Spec[R with Live, E] =
           spec.caseValue match {
             case Spec.ExecCase(exec, spec)     => Spec.exec(exec, loop(labels, spec))
             case Spec.LabeledCase(label, spec) => Spec.labeled(label, loop(label :: labels, spec))
-            case Spec.ManagedCase(managed)     => Spec.managed(managed.map(loop(labels, _)))
+            case Spec.ScopedCase(scoped)       => Spec.scoped[R](scoped.map(loop(labels, _)))
             case Spec.MultipleCase(specs) =>
               Spec.multiple(specs.map(loop(labels, _)))
             case Spec.TestCase(test, annotations) =>
@@ -62,7 +60,7 @@ trait TimeoutVariants {
     labels: List[String],
     duration: Duration
   ): URIO[Live, Unit] =
-    Live.live(console.putStrLn(renderWarning(labels, duration)).orDie)
+    Live.live(Console.printLine(renderWarning(labels, duration)).orDie)
 
   private def renderWarning(labels: List[String], duration: Duration): String =
     "Test " + labels.reverse.mkString(" - ") + " has taken more than " + duration.render +

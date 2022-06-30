@@ -17,117 +17,20 @@
 package zio.stream
 
 import zio._
-import zio.blocking.{Blocking, effectBlocking, effectBlockingIO}
-import zio.stream.compression._
+import zio.stream.compression.{CompressionException, CompressionLevel, CompressionStrategy, FlushMode}
 
 import java.io._
-import java.net.{InetSocketAddress, SocketAddress}
+import java.net.{InetSocketAddress, SocketAddress, URI}
 import java.nio.channels.{AsynchronousServerSocketChannel, AsynchronousSocketChannel, CompletionHandler, FileChannel}
 import java.nio.file.StandardOpenOption._
-import java.nio.file.{OpenOption, Path}
+import java.nio.file.{OpenOption, Path, Paths}
 import java.nio.{Buffer, ByteBuffer}
 import java.security.MessageDigest
 import java.util.zip.{DataFormatException, Inflater}
 import java.{util => ju}
 import scala.annotation.tailrec
 
-trait ZSinkPlatformSpecificConstructors {
-  self: ZSink.type =>
-
-  /**
-   * Creates a sink which digests incoming bytes using Java's MessageDigest
-   * class, returning in a single byte chunk with the digest value once the
-   * stream completes.
-   *
-   * @param createDigest
-   *   A block that creates an empty MessageDirect, typically by invoking
-   *   MessageDigest.getInstance with e.g. "SHA-1" or "SHA-256".
-   */
-  def digest(createDigest: => MessageDigest): ZSink[Any, Nothing, Byte, Nothing, Chunk[Byte]] =
-    ZSink {
-      for {
-        digest <- ZManaged.succeed(createDigest)
-      } yield { (optChunk: Option[Chunk[Byte]]) =>
-        optChunk match {
-          case None =>
-            ZIO.fail((Right(Chunk.fromArray(digest.digest())), Chunk.empty))
-          case Some(chunk) =>
-            ZIO.succeed {
-              digest.update(chunk.toArray)
-            }
-        }
-      }
-    }
-
-  /**
-   * Uses the provided `OutputStream` to create a [[ZSink]] that consumes byte
-   * chunks and writes them to the `OutputStream`. The sink will yield the count
-   * of bytes written.
-   *
-   * The caller of this function is responsible for closing the `OutputStream`.
-   */
-  final def fromOutputStream(
-    os: OutputStream
-  ): ZSink[Blocking, IOException, Byte, Byte, Long] = fromOutputStreamManaged(ZManaged.succeedNow(os))
-
-  /**
-   * Uses the provided `OutputStream` resource to create a [[ZSink]] that
-   * consumes byte chunks and writes them to the `OutputStream`. The sink will
-   * yield the count of bytes written.
-   *
-   * The `OutputStream` will be automatically closed after the stream is
-   * finished or an error occurred.
-   */
-  final def fromOutputStreamManaged(
-    os: ZManaged[Blocking, IOException, OutputStream]
-  ): ZSink[Blocking, IOException, Byte, Byte, Long] =
-    ZSink.managed(os) { out =>
-      ZSink.foldLeftChunksM(0L) { (bytesWritten, byteChunk: Chunk[Byte]) =>
-        blocking.effectBlockingInterrupt {
-          val bytes = byteChunk.toArray
-          out.write(bytes)
-          bytesWritten + bytes.length
-        }.refineOrDie { case e: IOException =>
-          e
-        }
-      }
-    }
-
-  /**
-   * Uses the provided `Path` to create a [[ZSink]] that consumes byte chunks
-   * and writes them to the `File`. The sink will yield count of bytes written.
-   */
-  final def fromFile(
-    path: => Path,
-    position: Long = 0L,
-    options: Set[OpenOption] = Set(WRITE, TRUNCATE_EXISTING, CREATE)
-  ): ZSink[Blocking, Throwable, Byte, Byte, Long] = {
-    val managedChannel = ZManaged.make(
-      blocking
-        .effectBlockingInterrupt(
-          FileChannel
-            .open(
-              path,
-              options.foldLeft(new ju.HashSet[OpenOption]()) { (acc, op) =>
-                acc.add(op); acc
-              } // for avoiding usage of different Java collection converters for different scala versions
-            )
-            .position(position)
-        )
-    )(chan => effectBlocking(chan.close()).orDie)
-
-    val writer: ZSink[Blocking, Throwable, Byte, Byte, Unit] = ZSink.managed(managedChannel) { chan =>
-      ZSink.foreachChunk[Blocking, Throwable, Byte](byteChunk =>
-        blocking.effectBlockingInterrupt {
-          chan.write(ByteBuffer.wrap(byteChunk.toArray))
-        }
-      )
-    }
-    writer &> ZSink.count
-  }
-}
-
-trait ZStreamPlatformSpecificConstructors {
+private[stream] trait ZStreamPlatformSpecificConstructors {
   self: ZStream.type =>
 
   /**
@@ -135,11 +38,11 @@ trait ZStreamPlatformSpecificConstructors {
    * times. The optionality of the error type `E` can be used to signal the end
    * of the stream, by setting it to `None`.
    */
-  def effectAsync[R, E, A](
+  def async[R, E, A](
     register: ZStream.Emit[R, E, A, Unit] => Unit,
-    outputBuffer: Int = 16
-  ): ZStream[R, E, A] =
-    effectAsyncMaybe(
+    outputBuffer: => Int = 16
+  )(implicit trace: Trace): ZStream[R, E, A] =
+    asyncMaybe(
       callback => {
         register(callback)
         None
@@ -153,61 +56,69 @@ trait ZStreamPlatformSpecificConstructors {
    * synchronously returns a stream. The optionality of the error type `E` can
    * be used to signal the end of the stream, by setting it to `None`.
    */
-  def effectAsyncInterrupt[R, E, A](
-    register: ZStream.Emit[R, E, A, Unit] => Either[Canceler[R], ZStream[R, E, A]],
-    outputBuffer: Int = 16
-  ): ZStream[R, E, A] =
-    ZStream {
-      for {
-        output  <- Queue.bounded[stream.Take[E, A]](outputBuffer).toManaged(_.shutdown)
-        runtime <- ZIO.runtime[R].toManaged_
-        eitherStream <- ZManaged.effectTotal {
-                          register(k =>
-                            try {
-                              runtime.unsafeRun(stream.Take.fromPull(k).flatMap(output.offer))
-                              ()
-                            } catch {
-                              case FiberFailure(c) if c.interrupted =>
-                            }
-                          )
+  def asyncInterrupt[R, E, A](
+    register: ZStream.Emit[R, E, A, Unit] => Either[URIO[R, Any], ZStream[R, E, A]],
+    outputBuffer: => Int = 16
+  )(implicit trace: Trace): ZStream[R, E, A] =
+    ZStream.unwrapScoped[R](for {
+      output  <- ZIO.acquireRelease(Queue.bounded[stream.Take[E, A]](outputBuffer))(_.shutdown)
+      runtime <- ZIO.runtime[R]
+      eitherStream <- ZIO.succeed {
+                        register { k =>
+                          try {
+                            runtime.unsafe
+                              .run(stream.Take.fromPull(k).flatMap(output.offer))(trace, Unsafe.unsafe)
+                              .getOrThrowFiberFailure()(Unsafe.unsafe)
+                          } catch {
+                            case FiberFailure(c) if c.isInterrupted =>
+                          }
                         }
-        pull <- eitherStream match {
-                  case Left(canceler) =>
-                    (for {
-                      done <- ZRef.makeManaged(false)
-                    } yield done.get.flatMap {
-                      if (_) Pull.end
-                      else
-                        output.take.flatMap(_.done).onError(_ => done.set(true) *> output.shutdown)
-                    }).ensuring(canceler)
-                  case Right(stream) => output.shutdown.toManaged_ *> stream.process
-                }
-      } yield pull
-    }
+                      }
+    } yield {
+      eitherStream match {
+        case Right(value) => ZStream.unwrap(output.shutdown as value)
+        case Left(canceler) =>
+          lazy val loop: ZChannel[Any, Any, Any, Any, E, Chunk[A], Unit] =
+            ZChannel.unwrap(
+              output.take
+                .flatMap(_.done)
+                .fold(
+                  maybeError =>
+                    ZChannel.fromZIO(output.shutdown) *>
+                      maybeError
+                        .fold[ZChannel[Any, Any, Any, Any, E, Chunk[A], Unit]](ZChannel.unit)(ZChannel.fail(_)),
+                  a => ZChannel.write(a) *> loop
+                )
+            )
+
+          ZStream.fromChannel(loop).ensuring(canceler)
+      }
+    })
 
   /**
    * Creates a stream from an asynchronous callback that can be called multiple
-   * times. The registration of the callback itself returns an a managed
+   * times. The registration of the callback itself returns an a scoped
    * resource. The optionality of the error type `E` can be used to signal the
    * end of the stream, by setting it to `None`.
    */
-  def effectAsyncManaged[R, E, A](
-    register: (ZIO[R, Option[E], Chunk[A]] => Unit) => ZManaged[R, E, Any],
-    outputBuffer: Int = 16
-  ): ZStream[R, E, A] =
-    managed {
+  def asyncScoped[R, E, A](
+    register: (ZIO[R, Option[E], Chunk[A]] => Unit) => ZIO[Scope with R, E, Any],
+    outputBuffer: => Int = 16
+  )(implicit trace: Trace): ZStream[R, E, A] =
+    scoped[R] {
       for {
-        output  <- Queue.bounded[stream.Take[E, A]](outputBuffer).toManaged(_.shutdown)
-        runtime <- ZIO.runtime[R].toManaged_
+        output  <- ZIO.acquireRelease(Queue.bounded[stream.Take[E, A]](outputBuffer))(_.shutdown)
+        runtime <- ZIO.runtime[R]
         _ <- register { k =>
                try {
-                 runtime.unsafeRun(stream.Take.fromPull(k).flatMap(output.offer))
-                 ()
+                 runtime.unsafe
+                   .run(stream.Take.fromPull(k).flatMap(output.offer))(trace, Unsafe.unsafe)
+                   .getOrThrowFiberFailure()(Unsafe.unsafe)
                } catch {
-                 case FiberFailure(c) if c.interrupted =>
+                 case FiberFailure(c) if c.isInterrupted =>
                }
              }
-        done <- ZRef.makeManaged(false)
+        done <- Ref.make(false)
         pull = done.get.flatMap {
                  if (_)
                    Pull.end
@@ -215,7 +126,7 @@ trait ZStreamPlatformSpecificConstructors {
                    output.take.flatMap(_.done).onError(_ => done.set(true) *> output.shutdown)
                }
       } yield pull
-    }.flatMap(repeatEffectChunkOption(_))
+    }.flatMap(repeatZIOChunkOption(_))
 
   /**
    * Creates a stream from an asynchronous callback that can be called multiple
@@ -223,31 +134,42 @@ trait ZStreamPlatformSpecificConstructors {
    * optionality of the error type `E` can be used to signal the end of the
    * stream, by setting it to `None`.
    */
-  def effectAsyncM[R, E, A](
+  def asyncZIO[R, E, A](
     register: ZStream.Emit[R, E, A, Unit] => ZIO[R, E, Any],
-    outputBuffer: Int = 16
-  ): ZStream[R, E, A] =
-    managed {
-      for {
-        output  <- Queue.bounded[stream.Take[E, A]](outputBuffer).toManaged(_.shutdown)
-        runtime <- ZIO.runtime[R].toManaged_
-        _ <- register { k =>
-               try {
-                 runtime.unsafeRun(stream.Take.fromPull(k).flatMap(output.offer))
-                 ()
-               } catch {
-                 case FiberFailure(c) if c.interrupted =>
-               }
-             }.toManaged_
-        done <- ZRef.makeManaged(false)
-        pull = done.get.flatMap {
-                 if (_)
-                   Pull.end
-                 else
-                   output.take.flatMap(_.done).onError(_ => done.set(true) *> output.shutdown)
-               }
-      } yield pull
-    }.flatMap(repeatEffectChunkOption(_))
+    outputBuffer: => Int = 16
+  )(implicit trace: Trace): ZStream[R, E, A] =
+    ZStream.fromChannel(ZChannel.unwrapScoped[R](for {
+      output  <- ZIO.acquireRelease(Queue.bounded[stream.Take[E, A]](outputBuffer))(_.shutdown)
+      runtime <- ZIO.runtime[R]
+      _ <- register { k =>
+             try {
+               runtime.unsafe
+                 .run(stream.Take.fromPull(k).flatMap(output.offer))(trace, Unsafe.unsafe)
+                 .getOrThrowFiberFailure()(Unsafe.unsafe)
+             } catch {
+               case FiberFailure(c) if c.isInterrupted =>
+             }
+           }
+    } yield {
+      lazy val loop: ZChannel[Any, Any, Any, Any, E, Chunk[A], Unit] = ZChannel.unwrap(
+        output.take
+          .flatMap(_.done)
+          .foldCauseZIO(
+            maybeError =>
+              output.shutdown as (maybeError.failureOrCause match {
+                case Left(Some(failure)) =>
+                  ZChannel.fail(failure)
+                case Left(None) =>
+                  ZChannel.unit
+                case Right(cause) =>
+                  ZChannel.failCause(cause)
+              }),
+            a => ZIO.succeedNow(ZChannel.write(a) *> loop)
+          )
+      )
+
+      loop
+    }))
 
   /**
    * Creates a stream from an asynchronous callback that can be called multiple
@@ -255,97 +177,60 @@ trait ZStreamPlatformSpecificConstructors {
    * synchronously. The optionality of the error type `E` can be used to signal
    * the end of the stream, by setting it to `None`.
    */
-  def effectAsyncMaybe[R, E, A](
+  def asyncMaybe[R, E, A](
     register: ZStream.Emit[R, E, A, Unit] => Option[ZStream[R, E, A]],
-    outputBuffer: Int = 16
-  ): ZStream[R, E, A] =
-    ZStream {
-      for {
-        output  <- Queue.bounded[stream.Take[E, A]](outputBuffer).toManaged(_.shutdown)
-        runtime <- ZIO.runtime[R].toManaged_
-        maybeStream <- ZManaged.effectTotal {
-                         register { k =>
-                           try {
-                             runtime.unsafeRun(stream.Take.fromPull(k).flatMap(output.offer))
-                             ()
-                           } catch {
-                             case FiberFailure(c) if c.interrupted =>
-                           }
-                         }
-                       }
-        pull <- maybeStream match {
-                  case Some(stream) => output.shutdown.toManaged_ *> stream.process
-                  case None =>
-                    for {
-                      done <- ZRef.makeManaged(false)
-                    } yield done.get.flatMap {
-                      if (_)
-                        Pull.end
-                      else
-                        output.take.flatMap(_.done).onError(_ => done.set(true) *> output.shutdown)
-                    }
-                }
-      } yield pull
-    }
+    outputBuffer: => Int = 16
+  )(implicit trace: Trace): ZStream[R, E, A] =
+    asyncInterrupt(k => register(k).toRight(ZIO.unit), outputBuffer)
 
   /**
-   * Creates a stream from an blocking iterator that may throw exceptions.
+   * Creates a stream of bytes from the specified file.
    */
-  def fromBlockingIterator[A](iterator: => Iterator[A], maxChunkSize: Int = 1): ZStream[Blocking, Throwable, A] =
-    ZStream {
-      ZManaged
-        .effect(iterator)
-        .fold(
-          Pull.fail,
-          iterator =>
-            ZIO.effectSuspendTotal {
-              if (maxChunkSize <= 1) {
-                if (iterator.isEmpty) Pull.end
-                else effectBlocking(Chunk.single(iterator.next())).asSomeError
-              } else {
-                val builder  = ChunkBuilder.make[A](maxChunkSize)
-                val blocking = effectBlocking(builder += iterator.next())
-
-                def go(i: Int): ZIO[Blocking, Throwable, Unit] =
-                  ZIO.when(i < maxChunkSize && iterator.hasNext)(blocking *> go(i + 1))
-
-                go(0).asSomeError.flatMap { _ =>
-                  val chunk = builder.result()
-                  if (chunk.isEmpty) Pull.end else Pull.emit(chunk)
-                }
-              }
-            }
-        )
-    }
+  final def fromFile(file: => File, chunkSize: => Int = ZStream.DefaultChunkSize)(implicit
+    trace: Trace
+  ): ZStream[Any, Throwable, Byte] =
+    ZStream
+      .fromZIO(ZIO.attempt(file.toPath))
+      .flatMap(path => self.fromPath(path, chunkSize))
 
   /**
-   * Creates a stream from an blocking Java iterator that may throw exceptions.
+   * Creates a stream of bytes from a file at the specified path represented by
+   * a string.
    */
-  def fromBlockingJavaIterator[A](
-    iter: => java.util.Iterator[A],
-    maxChunkSize: Int = 1
-  ): ZStream[Blocking, Throwable, A] =
-    fromBlockingIterator(
-      new Iterator[A] {
-        def next(): A        = iter.next
-        def hasNext: Boolean = iter.hasNext
-      },
-      maxChunkSize
-    )
+  final def fromFileName(name: => String, chunkSize: => Int = ZStream.DefaultChunkSize)(implicit
+    trace: Trace
+  ): ZStream[Any, Throwable, Byte] =
+    ZStream
+      .fromZIO(ZIO.attempt(Paths.get(name)))
+      .flatMap(path => self.fromPath(path, chunkSize))
+
+  /**
+   * Creates a stream of bytes from a file at the specified uri.
+   */
+  final def fromFileURI(uri: => URI, chunkSize: => Int = ZStream.DefaultChunkSize)(implicit
+    trace: Trace
+  ): ZStream[Any, Throwable, Byte] =
+    ZStream
+      .fromZIO(ZIO.attempt(Paths.get(uri)))
+      .flatMap(path => self.fromPath(path, chunkSize))
 
   /**
    * Creates a stream of bytes from a file at the specified path.
    */
-  def fromFile(path: => Path, chunkSize: Int = ZStream.DefaultChunkSize): ZStream[Blocking, Throwable, Byte] =
+  final def fromPath(path: => Path, chunkSize: => Int = ZStream.DefaultChunkSize)(implicit
+    trace: Trace
+  ): ZStream[Any, Throwable, Byte] =
     ZStream
-      .bracket(blocking.effectBlockingInterrupt(FileChannel.open(path)))(chan => effectBlocking(chan.close()).orDie)
+      .acquireReleaseWith(ZIO.attemptBlockingInterrupt(FileChannel.open(path)))(chan =>
+        ZIO.attemptBlocking(chan.close()).orDie
+      )
       .flatMap { channel =>
-        ZStream.fromEffect(UIO(ByteBuffer.allocate(chunkSize))).flatMap { reusableBuffer =>
-          ZStream.repeatEffectChunkOption(
+        ZStream.fromZIO(ZIO.succeed(ByteBuffer.allocate(chunkSize))).flatMap { reusableBuffer =>
+          ZStream.repeatZIOChunkOption(
             for {
-              bytesRead <- blocking.effectBlockingInterrupt(channel.read(reusableBuffer)).mapError(Some(_))
+              bytesRead <- ZIO.attemptBlockingInterrupt(channel.read(reusableBuffer)).asSomeError
               _         <- ZIO.fail(None).when(bytesRead == -1)
-              chunk <- UIO {
+              chunk <- ZIO.succeed {
                          reusableBuffer.flip()
                          Chunk.fromByteBuffer(reusableBuffer)
                        }
@@ -355,107 +240,65 @@ trait ZStreamPlatformSpecificConstructors {
       }
 
   /**
-   * Creates a stream from a `java.io.InputStream`. Note: the input stream will
-   * not be explicitly closed after it is exhausted.
-   */
-  def fromInputStream(
-    is: => InputStream,
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[Blocking, IOException, Byte] =
-    ZStream.fromEffect(UIO(is)).flatMap { capturedIs =>
-      ZStream.repeatEffectChunkOption {
-        for {
-          bufArray  <- UIO(Array.ofDim[Byte](chunkSize))
-          bytesRead <- blocking.effectBlockingIO(capturedIs.read(bufArray)).mapError(Some(_))
-          bytes <- if (bytesRead < 0)
-                     ZIO.fail(None)
-                   else if (bytesRead == 0)
-                     UIO(Chunk.empty)
-                   else if (bytesRead < chunkSize)
-                     UIO(Chunk.fromArray(bufArray).take(bytesRead))
-                   else
-                     UIO(Chunk.fromArray(bufArray))
-        } yield bytes
-      }
-    }
-
-  /**
    * Creates a stream from the resource specified in `path`
    */
   final def fromResource(
-    path: String,
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[Blocking, IOException, Byte] =
-    ZStream.managed {
-      ZManaged.fromAutoCloseable {
-        effectBlockingIO(getClass.getClassLoader.getResourceAsStream(path.replace('\\', '/'))).flatMap { x =>
-          if (x == null)
-            ZIO.fail(new FileNotFoundException(s"No such resource: '$path'"))
-          else
-            ZIO.succeed(x)
+    path: => String,
+    chunkSize: => Int = ZStream.DefaultChunkSize
+  )(implicit trace: Trace): ZStream[Any, IOException, Byte] =
+    ZStream.scoped {
+      ZIO.fromAutoCloseable {
+        ZIO.succeed(path).flatMap { path =>
+          ZIO.attemptBlockingIO(getClass.getClassLoader.getResourceAsStream(path.replace('\\', '/'))).flatMap { x =>
+            if (x == null)
+              ZIO.fail(new FileNotFoundException(s"No such resource: '$path'"))
+            else
+              ZIO.succeedNow(x)
+          }
         }
       }
     }.flatMap(is => fromInputStream(is, chunkSize = chunkSize))
 
   /**
-   * Creates a stream from a `java.io.InputStream`. Ensures that the input
-   * stream is closed after it is exhausted.
-   */
-  def fromInputStreamEffect[R](
-    is: ZIO[R, IOException, InputStream],
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[R with Blocking, IOException, Byte] =
-    fromInputStreamManaged(is.toManaged(is => ZIO.effectTotal(is.close())), chunkSize)
-
-  /**
-   * Creates a stream from a managed `java.io.InputStream` value.
-   */
-  def fromInputStreamManaged[R](
-    is: ZManaged[R, IOException, InputStream],
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[R with Blocking, IOException, Byte] =
-    ZStream
-      .managed(is)
-      .flatMap(fromInputStream(_, chunkSize))
-
-  /**
    * Creates a stream from `java.io.Reader`.
    */
-  def fromReader(reader: => Reader, chunkSize: Int = ZStream.DefaultChunkSize): ZStream[Blocking, IOException, Char] =
-    ZStream.fromEffect(UIO(reader)).flatMap { capturedReader =>
-      ZStream.repeatEffectChunkOption {
+  def fromReader(reader: => Reader, chunkSize: => Int = ZStream.DefaultChunkSize)(implicit
+    trace: Trace
+  ): ZStream[Any, IOException, Char] =
+    ZStream.succeed((reader, chunkSize)).flatMap { case (reader, chunkSize) =>
+      ZStream.repeatZIOChunkOption {
         for {
-          bufArray  <- UIO(Array.ofDim[Char](chunkSize))
-          bytesRead <- blocking.effectBlockingIO(capturedReader.read(bufArray)).mapError(Some(_))
+          bufArray  <- ZIO.succeed(Array.ofDim[Char](chunkSize))
+          bytesRead <- ZIO.attemptBlockingIO(reader.read(bufArray)).asSomeError
           chars <- if (bytesRead < 0)
                      ZIO.fail(None)
                    else if (bytesRead == 0)
-                     UIO(Chunk.empty)
+                     ZIO.succeed(Chunk.empty)
                    else if (bytesRead < chunkSize)
-                     UIO(Chunk.fromArray(bufArray).take(bytesRead))
+                     ZIO.succeed(Chunk.fromArray(bufArray).take(bytesRead))
                    else
-                     UIO(Chunk.fromArray(bufArray))
+                     ZIO.succeed(Chunk.fromArray(bufArray))
         } yield chars
       }
     }
 
   /**
-   * Creates a stream from an effect producing `java.io.Reader`.
+   * Creates a stream from scoped `java.io.Reader`.
    */
-  def fromReaderEffect[R](
-    reader: => ZIO[R, IOException, Reader],
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[R with Blocking, IOException, Char] =
-    fromReaderManaged(reader.toManaged(r => ZIO.effectTotal(r.close())), chunkSize)
+  def fromReaderScoped[R](
+    reader: => ZIO[Scope with R, IOException, Reader],
+    chunkSize: => Int = ZStream.DefaultChunkSize
+  )(implicit trace: Trace): ZStream[R, IOException, Char] =
+    ZStream.scoped[R](reader).flatMap(fromReader(_, chunkSize))
 
   /**
-   * Creates a stream from managed `java.io.Reader`.
+   * Creates a stream from an effect producing `java.io.Reader`.
    */
-  def fromReaderManaged[R](
-    reader: => ZManaged[R, IOException, Reader],
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[R with Blocking, IOException, Char] =
-    ZStream.managed(reader).flatMap(fromReader(_, chunkSize))
+  def fromReaderZIO[R](
+    reader: => ZIO[R, IOException, Reader],
+    chunkSize: => Int = ZStream.DefaultChunkSize
+  )(implicit trace: Trace): ZStream[R, IOException, Char] =
+    fromReaderScoped[R](ZIO.acquireRelease(reader)(reader => ZIO.succeed(reader.close())), chunkSize)
 
   /**
    * Creates a stream from a callback that writes to `java.io.OutputStream`.
@@ -463,20 +306,20 @@ trait ZStreamPlatformSpecificConstructors {
    */
   def fromOutputStreamWriter(
     write: OutputStream => Unit,
-    chunkSize: Int = ZStream.DefaultChunkSize
-  ): ZStream[Blocking, Throwable, Byte] = {
-    def from(in: InputStream, out: OutputStream, done: Promise[None.type, Nothing]) =
-      (fromInputStream(in, chunkSize) ++ fromEffectOption(done.await)).drainFork(
-        fromEffect(blocking.effectBlockingInterrupt {
+    chunkSize: => Int = ZStream.DefaultChunkSize
+  )(implicit trace: Trace): ZStream[Any, Throwable, Byte] = {
+    def from(in: InputStream, out: OutputStream, done: Promise[None.type, Nothing]): ZStream[Any, Throwable, Byte] =
+      (fromInputStream(in, chunkSize) ++ fromZIOOption(done.await)).drainFork(
+        fromZIO(ZIO.attemptBlockingInterrupt {
           try write(out)
           finally out.close()
-        }) ++ fromEffect(done.fail(None))
+        }) ++ fromZIO(done.fail(None))
       )
 
     for {
-      out    <- fromEffect(ZIO.effect(new PipedOutputStream()))
-      in     <- managed(ZManaged.fromAutoCloseable(ZIO.effect(new PipedInputStream(out))))
-      done   <- fromEffect(Promise.make[None.type, Nothing])
+      out    <- fromZIO(ZIO.attempt(new PipedOutputStream()))
+      in     <- scoped(ZIO.fromAutoCloseable(ZIO.attempt(new PipedInputStream(out))))
+      done   <- fromZIO(Promise.make[None.type, Nothing])
       result <- from(in, out, done)
     } yield result
   }
@@ -484,26 +327,36 @@ trait ZStreamPlatformSpecificConstructors {
   /**
    * Creates a stream from a Java stream
    */
-  final def fromJavaStream[A](stream: => ju.stream.Stream[A]): ZStream[Any, Throwable, A] =
-    ZStream.fromJavaIteratorManaged(ZManaged.makeEffect(stream)(_.close()).map(_.iterator()))
+  final def fromJavaStream[A](stream: => java.util.stream.Stream[A])(implicit
+    trace: Trace
+  ): ZStream[Any, Throwable, A] =
+    ZStream.fromJavaIteratorScoped(
+      ZIO.acquireRelease(ZIO.attempt(stream))(stream => ZIO.succeed(stream.close())).map(_.iterator())
+    )
+
+  /**
+   * Creates a stream from a scoped Java stream
+   */
+  final def fromJavaStreamScoped[R, A](
+    stream: => ZIO[Scope with R, Throwable, java.util.stream.Stream[A]]
+  )(implicit trace: Trace): ZStream[R, Throwable, A] =
+    ZStream.scoped[R](stream).flatMap(ZStream.fromJavaStream(_))
 
   /**
    * Creates a stream from a Java stream
    */
-  final def fromJavaStreamEffect[R, A](stream: ZIO[R, Throwable, ju.stream.Stream[A]]): ZStream[R, Throwable, A] =
-    ZStream.fromEffect(stream).flatMap(ZStream.fromJavaStream(_))
-
-  /**
-   * Creates a stream from a managed Java stream
-   */
-  final def fromJavaStreamManaged[R, A](stream: ZManaged[R, Throwable, ju.stream.Stream[A]]): ZStream[R, Throwable, A] =
-    ZStream.managed(stream).flatMap(ZStream.fromJavaStream(_))
+  final def fromJavaStreamSucceed[R, A](stream: => java.util.stream.Stream[A])(implicit
+    trace: Trace
+  ): ZStream[R, Nothing, A] =
+    ZStream.fromJavaIteratorSucceed(stream.iterator())
 
   /**
    * Creates a stream from a Java stream
    */
-  final def fromJavaStreamTotal[A](stream: => ju.stream.Stream[A]): ZStream[Any, Nothing, A] =
-    ZStream.fromJavaIteratorTotal(stream.iterator())
+  final def fromJavaStreamZIO[R, A](stream: => ZIO[R, Throwable, java.util.stream.Stream[A]])(implicit
+    trace: Trace
+  ): ZStream[R, Throwable, A] =
+    ZStream.fromZIO(stream).flatMap(ZStream.fromJavaStream(_))
 
   /**
    * Create a stream of accepted connection from server socket Emit socket
@@ -511,11 +364,11 @@ trait ZStreamPlatformSpecificConstructors {
    * it is used
    */
   def fromSocketServer(
-    port: Int,
-    host: Option[String] = None
-  ): ZStream[Blocking, Throwable, Connection] =
+    port: => Int,
+    host: => Option[String] = None
+  )(implicit trace: Trace): ZStream[Any, Throwable, Connection] =
     for {
-      server <- ZStream.managed(ZManaged.fromAutoCloseable(effectBlocking {
+      server <- ZStream.scoped(ZIO.fromAutoCloseable(ZIO.attemptBlocking {
                   AsynchronousServerSocketChannel
                     .open()
                     .bind(
@@ -523,21 +376,23 @@ trait ZStreamPlatformSpecificConstructors {
                     )
                 }))
 
-      registerConnection <- ZStream.managed(ZManaged.scope)
+      registerConnection <- ZStream.scoped(ZIO.acquireReleaseExit(Scope.make)((scope, exit) => scope.close(exit)))
 
-      conn <- ZStream.repeatEffect {
-                IO.effectAsync[Throwable, UManaged[Connection]] { callback =>
-                  server.accept(
-                    null,
-                    new CompletionHandler[AsynchronousSocketChannel, Void]() {
-                      self =>
-                      override def completed(socket: AsynchronousSocketChannel, attachment: Void): Unit =
-                        callback(ZIO.succeed(Connection.make(socket)))
+      conn <- ZStream.repeatZIO {
+                ZIO
+                  .async[Any, Throwable, ZIO[Scope, Nothing, Connection]] { callback =>
+                    server.accept(
+                      null,
+                      new CompletionHandler[AsynchronousSocketChannel, Void]() {
+                        self =>
+                        override def completed(socket: AsynchronousSocketChannel, attachment: Void): Unit =
+                          callback(ZIO.succeed(Connection.make(socket)))
 
-                      override def failed(exc: Throwable, attachment: Void): Unit = callback(ZIO.fail(exc))
-                    }
-                  )
-                }.flatMap(managedConn => registerConnection(managedConn).map(_._2))
+                        override def failed(exc: Throwable, attachment: Void): Unit = callback(ZIO.fail(exc))
+                      }
+                    )
+                  }
+                  .flatMap(scopedConn => registerConnection.extend(scopedConn))
               }
     } yield conn
 
@@ -545,58 +400,55 @@ trait ZStreamPlatformSpecificConstructors {
    * Accepted connection made to a specific channel
    * `AsynchronousServerSocketChannel`
    */
-  class Connection(socket: AsynchronousSocketChannel) {
+  final class Connection private (socket: AsynchronousSocketChannel) {
 
     /**
      * The remote address, i.e. the connected client
      */
-    def remoteAddress: IO[IOException, SocketAddress] = IO
-      .effect(socket.getRemoteAddress)
+    def remoteAddress(implicit trace: Trace): IO[IOException, SocketAddress] = ZIO
+      .attempt(socket.getRemoteAddress)
       .refineToOrDie[IOException]
 
     /**
      * The local address, i.e. our server
      */
-    def localAddress: IO[IOException, SocketAddress] = IO
-      .effect(socket.getLocalAddress)
+    def localAddress(implicit trace: Trace): IO[IOException, SocketAddress] = ZIO
+      .attempt(socket.getLocalAddress)
       .refineToOrDie[IOException]
 
     /**
      * Read the entire `AsynchronousSocketChannel` by emitting a `Chunk[Byte]`
-     * The caller of this function is NOT responsible for closing the
-     * `AsynchronousSocketChannel`.
      */
-    def read: Stream[Throwable, Byte] =
-      ZStream.unfoldChunkM(0) {
-        case -1 => ZIO.succeed(Option.empty)
-        case _ =>
-          val buff = ByteBuffer.allocate(ZStream.DefaultChunkSize)
+    def read(implicit trace: Trace): ZStream[Any, Throwable, Byte] =
+      ZStream.fromZIO(ZIO.succeed(ByteBuffer.allocate(ZStream.DefaultChunkSize))).flatMap { reusableBuffer =>
+        ZStream.unfoldChunkZIO(0) {
+          case -1 => ZIO.succeed(Option.empty)
+          case _ =>
+            ZIO.async[Any, Throwable, Option[(Chunk[Byte], Int)]] { callback =>
+              socket.read(
+                reusableBuffer,
+                null,
+                new CompletionHandler[Integer, Void] {
+                  override def completed(bytesRead: Integer, attachment: Void): Unit = {
+                    (reusableBuffer: Buffer).flip()
+                    callback(ZIO.succeed(Option(Chunk.fromByteBuffer(reusableBuffer) -> bytesRead.toInt)))
+                  }
 
-          IO.effectAsync[Throwable, Option[(Chunk[Byte], Int)]] { callback =>
-            socket.read(
-              buff,
-              null,
-              new CompletionHandler[Integer, Void] {
-                override def completed(bytesRead: Integer, attachment: Void): Unit = {
-                  (buff: Buffer).flip()
-                  callback(ZIO.succeed(Option(Chunk.fromByteBuffer(buff) -> bytesRead.toInt)))
+                  override def failed(error: Throwable, attachment: Void): Unit = callback(ZIO.fail(error))
                 }
-
-                override def failed(error: Throwable, attachment: Void): Unit = callback(ZIO.fail(error))
-              }
-            )
-          }
+              )
+            }
+        }
       }
 
     /**
-     * Write the entire Chuck[Byte] to the socket channel. The caller of this
-     * function is NOT responsible for closing the `AsynchronousSocketChannel`.
+     * Write the entire Chunk[Byte] to the socket channel.
      *
      * The sink will yield the count of bytes written.
      */
-    def write: Sink[Throwable, Byte, Nothing, Int] =
-      ZSink.foldLeftChunksM(0) { case (nbBytesWritten, c) =>
-        IO.effectAsync[Throwable, Int] { callback =>
+    def write(implicit trace: Trace): ZSink[Any, Throwable, Byte, Nothing, Int] =
+      ZSink.foldLeftChunksZIO[Any, Throwable, Byte, Int](0) { case (nbBytesWritten, c) =>
+        ZIO.async[Any, Throwable, Int] { callback =>
           socket.write(
             ByteBuffer.wrap(c.toArray),
             null,
@@ -613,166 +465,261 @@ trait ZStreamPlatformSpecificConstructors {
     /**
      * Close the underlying socket
      */
-    def close(): UIO[Unit] = ZIO.effectTotal(socket.close())
+    private[stream] def close()(implicit trace: Trace): UIO[Unit] = ZIO.succeed(socket.close())
 
     /**
      * Close only the write, so the remote end will see EOF
      */
-    def closeWrite(): UIO[Unit] = ZIO.effectTotal(socket.shutdownOutput()).unit
+    def closeWrite()(implicit trace: Trace): IO[IOException, Unit] =
+      ZIO.attempt(socket.shutdownOutput()).unit.refineToOrDie[IOException]
+
   }
 
   object Connection {
 
     /**
-     * Create a `Managed` connection
+     * Create a scoped connection
      */
-    def make(socket: AsynchronousSocketChannel): UManaged[Connection] =
-      Managed.make(ZIO.succeed(new Connection(socket)))(_.close())
+    def make(socket: AsynchronousSocketChannel)(implicit trace: Trace): ZIO[Scope, Nothing, Connection] =
+      ZIO.acquireRelease(ZIO.succeed(new Connection(socket)))(_.close())
   }
+
+  trait ZStreamConstructorPlatformSpecific extends ZStreamConstructorLowPriority1 {
+
+    /**
+     * Constructs a `ZStream[Any, Throwable, A]` from a
+     * `java.util.stream.Stream[A]`.
+     */
+    implicit def JavaStreamConstructor[A, StreamLike[A] <: java.util.stream.Stream[A]]
+      : WithOut[StreamLike[A], ZStream[Any, Throwable, A]] =
+      new ZStreamConstructor[StreamLike[A]] {
+        type Out = ZStream[Any, Throwable, A]
+        def make(input: => StreamLike[A])(implicit trace: Trace): ZStream[Any, Throwable, A] =
+          ZStream.fromJavaStream(input)
+      }
+
+    /**
+     * Constructs a `ZStream[Any, Throwable, A]` from a `ZIO[R with Scope,
+     * Throwable, java.util.stream.Stream[A]]`.
+     */
+    implicit def JavaStreamScopedConstructor[R, E <: Throwable, A, StreamLike[A] <: java.util.stream.Stream[A]]
+      : WithOut[ZIO[Scope with R, E, StreamLike[A]], ZStream[R, Throwable, A]] =
+      new ZStreamConstructor[ZIO[Scope with R, E, StreamLike[A]]] {
+        type Out = ZStream[R, Throwable, A]
+        def make(input: => ZIO[Scope with R, E, StreamLike[A]])(implicit
+          trace: Trace
+        ): ZStream[R, Throwable, A] =
+          ZStream.fromJavaStreamScoped[R, A](input)
+      }
+
+    /**
+     * Constructs a `ZStream[Any, Throwable, A]` from a `ZIO[R, Throwable,
+     * java.util.stream.Stream[A]]`.
+     */
+    implicit def JavaStreamZIOConstructor[R, E <: Throwable, A, StreamLike[A] <: java.util.stream.Stream[A]]
+      : WithOut[ZIO[R, E, StreamLike[A]], ZStream[R, Throwable, A]] =
+      new ZStreamConstructor[ZIO[R, E, StreamLike[A]]] {
+        type Out = ZStream[R, Throwable, A]
+        def make(input: => ZIO[R, E, StreamLike[A]])(implicit trace: Trace): ZStream[R, Throwable, A] =
+          ZStream.fromJavaStreamZIO(input)
+      }
+
+  }
+}
+
+private[stream] trait ZSinkPlatformSpecificConstructors {
+  self: ZSink.type =>
+
+  /**
+   * Creates a sink which digests incoming bytes using Java's MessageDigest
+   * class, returning the digest value.
+   */
+  def digest(digest: => MessageDigest): ZSink[Any, Nothing, Byte, Nothing, Chunk[Byte]] =
+    ZSink.suspend {
+
+      def loop(digest: MessageDigest): ZChannel[Any, Nothing, Chunk[Byte], Any, Nothing, Nothing, Chunk[Byte]] =
+        ZChannel.readWithCause[Any, Nothing, Chunk[Byte], Any, Nothing, Nothing, Chunk[Byte]](
+          in =>
+            ZChannel
+              .succeedNow(digest.update(in.toArray))
+              .zipRight[Any, Nothing, Chunk[Byte], Any, Nothing, Nothing, Chunk[Byte]](loop(digest)),
+          cause => ZChannel.failCause(cause),
+          _ => ZChannel.succeedNow(Chunk.fromArray(digest.digest))
+        )
+
+      ZSink.fromChannel(loop(digest))
+    }
+
+  /**
+   * Uses the provided `File` to create a [[ZSink]] that consumes byte chunks
+   * and writes them to the `File`. The sink will yield count of bytes written.
+   */
+  final def fromFile(
+    file: => File,
+    position: => Long = 0L,
+    options: => Set[OpenOption] = Set(WRITE, TRUNCATE_EXISTING, CREATE)
+  )(implicit
+    trace: Trace
+  ): ZSink[Any, Throwable, Byte, Byte, Long] =
+    ZSink
+      .fromZIO(ZIO.attempt(file.toPath))
+      .flatMap(path => self.fromPath(path, position, options))
+
+  /**
+   * Uses the provided `Path` represented as a string to create a [[ZSink]] that
+   * consumes byte chunks and writes them to the `File`. The sink will yield
+   * count of bytes written.
+   */
+  final def fromFileName(
+    name: => String,
+    position: => Long = 0L,
+    options: => Set[OpenOption] = Set(WRITE, TRUNCATE_EXISTING, CREATE)
+  )(implicit
+    trace: Trace
+  ): ZSink[Any, Throwable, Byte, Byte, Long] =
+    ZSink
+      .fromZIO(ZIO.attempt(Paths.get(name)))
+      .flatMap(path => self.fromPath(path, position, options))
+
+  /**
+   * Uses the provided `URI` to create a [[ZSink]] that consumes byte chunks and
+   * writes them to the `File`. The sink will yield count of bytes written.
+   */
+  final def fromFileURI(
+    uri: => URI,
+    position: => Long = 0L,
+    options: => Set[OpenOption] = Set(WRITE, TRUNCATE_EXISTING, CREATE)
+  )(implicit
+    trace: Trace
+  ): ZSink[Any, Throwable, Byte, Byte, Long] =
+    ZSink
+      .fromZIO(ZIO.attempt(Paths.get(uri)))
+      .flatMap(path => self.fromPath(path, position, options))
+
+  /**
+   * Uses the provided `Path` to create a [[ZSink]] that consumes byte chunks
+   * and writes them to the `File`. The sink will yield count of bytes written.
+   */
+  final def fromPath(
+    path: => Path,
+    position: => Long = 0L,
+    options: => Set[OpenOption] = Set(WRITE, TRUNCATE_EXISTING, CREATE)
+  )(implicit
+    trace: Trace
+  ): ZSink[Any, Throwable, Byte, Byte, Long] = {
+
+    val scopedChannel = ZIO.acquireRelease(
+      ZIO
+        .attemptBlockingInterrupt(
+          FileChannel
+            .open(
+              path,
+              options.foldLeft(
+                new ju.HashSet[OpenOption]()
+              ) { (acc, op) =>
+                acc.add(op)
+                acc
+              } // for avoiding usage of different Java collection converters for different scala versions
+            )
+            .position(position)
+        )
+    )(chan => ZIO.attemptBlocking(chan.close()).orDie)
+
+    ZSink.unwrapScoped {
+      scopedChannel.map { chan =>
+        ZSink.foldLeftChunksZIO(0L) { (bytesWritten, byteChunk: Chunk[Byte]) =>
+          ZIO.attemptBlockingInterrupt {
+            val bytes = byteChunk.toArray
+
+            chan.write(ByteBuffer.wrap(bytes))
+
+            bytesWritten + bytes.length.toLong
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Uses the provided `OutputStream` to create a [[ZSink]] that consumes byte
+   * chunks and writes them to the `OutputStream`. The sink will yield the count
+   * of bytes written.
+   *
+   * The caller of this function is responsible for closing the `OutputStream`.
+   */
+  final def fromOutputStream(
+    os: => OutputStream
+  )(implicit trace: Trace): ZSink[Any, IOException, Byte, Byte, Long] = fromOutputStreamScoped(
+    ZIO.succeedNow(os)
+  )
+
+  /**
+   * Uses the provided `OutputStream` resource to create a [[ZSink]] that
+   * consumes byte chunks and writes them to the `OutputStream`. The sink will
+   * yield the count of bytes written.
+   *
+   * The `OutputStream` will be automatically closed after the stream is
+   * finished or an error occurred.
+   */
+  final def fromOutputStreamScoped(
+    os: => ZIO[Scope, IOException, OutputStream]
+  )(implicit trace: Trace): ZSink[Any, IOException, Byte, Byte, Long] =
+    ZSink.unwrapScoped {
+      os.map { out =>
+        ZSink.foldLeftChunksZIO(0L) { (bytesWritten, byteChunk: Chunk[Byte]) =>
+          ZIO.attemptBlockingInterrupt {
+            val bytes = byteChunk.toArray
+            out.write(bytes)
+            bytesWritten + bytes.length
+          }.refineOrDie { case e: IOException =>
+            e
+          }
+        }
+      }
+    }
 
 }
 
-trait ZTransducerPlatformSpecificConstructors {
-  self: ZTransducer.type =>
-
-  /**
-   * Compresses stream with 'deflate' method described in
-   * https://tools.ietf.org/html/rfc1951. Each incoming chunk is compressed at
-   * once, so it can utilize thread for long time if chunks are big.
-   *
-   * @param bufferSize
-   *   Size of internal buffer used for pulling data from deflater, affects
-   *   performance.
-   * @param noWrap
-   *   Whether output stream is wrapped in ZLIB header and trailer. For HTTP
-   *   'deflate' content-encoding should be false, see
-   *   https://tools.ietf.org/html/rfc2616.
-   */
+private[stream] trait ZPipelinePlatformSpecificConstructors {
   def deflate(
-    bufferSize: Int = 64 * 1024,
-    noWrap: Boolean = false,
-    level: CompressionLevel = CompressionLevel.DefaultCompression,
-    strategy: CompressionStrategy = CompressionStrategy.DefaultStrategy,
-    flushMode: FlushMode = FlushMode.NoFlush
-  ): ZTransducer[Any, Nothing, Byte, Byte] =
-    ZTransducer(Deflate.makeDeflater(bufferSize, noWrap, level, strategy, flushMode))
-
-  /**
-   * Decompresses deflated stream. Compression method is described in
-   * https://tools.ietf.org/html/rfc1951.
-   *
-   * @param noWrap
-   *   Whether is wrapped in ZLIB header and trailer, see
-   *   https://tools.ietf.org/html/rfc1951. For HTTP 'deflate' content-encoding
-   *   should be false, see https://tools.ietf.org/html/rfc2616.
-   * @param bufferSize
-   *   Size of buffer used internally, affects performance.
-   */
-  def inflate(
-    bufferSize: Int = 64 * 1024,
-    noWrap: Boolean = false
-  ): ZTransducer[Any, CompressionException, Byte, Byte] = {
-    def makeInflater: ZManaged[Any, Nothing, Option[Chunk[Byte]] => ZIO[Any, CompressionException, Chunk[Byte]]] =
-      ZManaged
-        .make(ZIO.effectTotal((new Array[Byte](bufferSize), new Inflater(noWrap)))) { case (_, inflater) =>
-          ZIO.effectTotal(inflater.end())
-        }
-        .map {
-          case (buffer, inflater) => {
-            case None =>
-              ZIO.effect {
-                if (inflater.finished()) {
-                  inflater.reset()
-                  Chunk.empty
-                } else {
-                  throw CompressionException("Inflater is not finished when input stream completed")
-                }
-              }.refineOrDie { case e: DataFormatException =>
-                CompressionException(e)
-              }
-            case Some(chunk) =>
-              ZIO.effect {
-                inflater.setInput(chunk.toArray)
-                pullAllOutput(inflater, buffer, chunk)
-              }.refineOrDie { case e: DataFormatException =>
-                CompressionException(e)
-              }
-          }
-        }
-
-    // Pulls all available output from the inflater.
-    def pullAllOutput(
-      inflater: Inflater,
-      buffer: Array[Byte],
-      input: Chunk[Byte]
-    ): Chunk[Byte] = {
-      @tailrec
-      def next(acc: Chunk[Byte]): Chunk[Byte] = {
-        val read      = inflater.inflate(buffer)
-        val remaining = inflater.getRemaining()
-        val current   = Chunk.fromArray(ju.Arrays.copyOf(buffer, read))
-        if (remaining > 0) {
-          if (read > 0) next(acc ++ current)
-          else if (inflater.finished()) {
-            val leftover = input.takeRight(remaining)
-            inflater.reset()
-            inflater.setInput(leftover.toArray)
-            next(acc ++ current)
-          } else {
-            // Impossible happened (aka programmer error). Die.
-            throw new Exception("read = 0, remaining > 0, not finished")
-          }
-        } else if (read > 0) next(acc ++ current)
-        else acc ++ current
-      }
-
-      if (inflater.needsInput()) Chunk.empty else next(Chunk.empty)
-    }
-
-    ZTransducer(makeInflater)
-  }
-
-  /**
-   * @param bufferSize
-   *   Size of buffer used internally, affects performance.
-   * @param level
-   * @param strategy
-   * @param flushMode
-   * @return
-   */
-  def gzip(
-    bufferSize: Int = 64 * 1024,
-    level: CompressionLevel = CompressionLevel.DefaultCompression,
-    strategy: CompressionStrategy = CompressionStrategy.DefaultStrategy,
-    flushMode: FlushMode = FlushMode.NoFlush
-  ): ZTransducer[Any, Nothing, Byte, Byte] =
-    ZTransducer(
-      ZManaged
-        .make(Gzipper.make(bufferSize, level, strategy, flushMode))(gzipper => ZIO.effectTotal(gzipper.close()))
-        .map { gzipper =>
-          {
-            case None        => gzipper.onNone
-            case Some(chunk) => gzipper.onChunk(chunk)
-          }
-        }
+    bufferSize: => Int = 64 * 1024,
+    noWrap: => Boolean = false,
+    level: => CompressionLevel = CompressionLevel.DefaultCompression,
+    strategy: => CompressionStrategy = CompressionStrategy.DefaultStrategy,
+    flushMode: => FlushMode = FlushMode.NoFlush
+  )(implicit trace: Trace): ZPipeline[Any, Nothing, Byte, Byte] =
+    ZPipeline.fromChannel(
+      Deflate.makeDeflater(
+        bufferSize,
+        noWrap,
+        level,
+        strategy,
+        flushMode
+      )
     )
 
-  /**
-   * Decompresses gzipped stream. Compression method is described in
-   * https://tools.ietf.org/html/rfc1952.
-   *
-   * @param bufferSize
-   *   Size of buffer used internally, affects performance.
-   */
-  def gunzip(bufferSize: Int = 64 * 1024): ZTransducer[Any, CompressionException, Byte, Byte] =
-    ZTransducer(
-      ZManaged
-        .make(Gunzipper.make(bufferSize))(gunzipper => ZIO.effectTotal(gunzipper.close()))
-        .map { gunzipper =>
-          {
-            case None        => gunzipper.onNone
-            case Some(chunk) => gunzipper.onChunk(chunk)
-          }
-        }
+  def inflate(
+    bufferSize: => Int = 64 * 1024,
+    noWrap: => Boolean = false
+  )(implicit trace: Trace): ZPipeline[Any, CompressionException, Byte, Byte] =
+    ZPipeline.fromChannel(
+      Inflate.makeInflater(bufferSize, noWrap)
+    )
+
+  def gzip(
+    bufferSize: => Int = 64 * 1024,
+    level: => CompressionLevel = CompressionLevel.DefaultCompression,
+    strategy: => CompressionStrategy = CompressionStrategy.DefaultStrategy,
+    flushMode: => FlushMode = FlushMode.NoFlush
+  )(implicit trace: Trace): ZPipeline[Any, Nothing, Byte, Byte] =
+    ZPipeline.fromChannel(
+      Gzip.makeGzipper(bufferSize, level, strategy, flushMode)
+    )
+
+  def gunzip[Env](bufferSize: => Int = 64 * 1024)(implicit
+    trace: Trace
+  ): ZPipeline[Any, CompressionException, Byte, Byte] =
+    ZPipeline.fromChannel(
+      Gunzip.makeGunzipper(bufferSize)
     )
 }

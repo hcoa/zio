@@ -17,20 +17,24 @@
 package zio.test
 
 import zio._
-import zio.random.Random
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 trait GenZIO {
 
   /**
    * A generator of `Cause` values
    */
-  final def causes[R <: Random with Sized, E](e: Gen[R, E], t: Gen[R, Throwable]): Gen[R, Cause[E]] = {
-    val failure        = e.map(Cause.fail)
-    val die            = t.map(Cause.die)
-    val empty          = Gen.const(Cause.empty)
-    val interrupt      = Gen.anyLong.crossWith(Gen.anyLong)((l, r) => Cause.interrupt(Fiber.Id(l, r)))
-    def traced(n: Int) = Gen.suspend(causesN(n - 1).map(Cause.Traced(_, ZTrace(Fiber.Id(0L, 0L), Nil, Nil, None))))
-    def meta(n: Int)   = Gen.suspend(causesN(n - 1).flatMap(c => Gen.elements(Cause.stack(c), Cause.stackless(c))))
+  final def causes[R <: Sized, E](e: Gen[R, E], t: Gen[R, Throwable])(implicit
+    trace: Trace
+  ): Gen[R, Cause[E]] = {
+    val fiberId           = (Gen.int zip Gen.int zip Gen.const(Trace.empty)).map { case (a, b, c) => FiberId(a, b, c) }
+    val zTraceElement     = Gen.string.map(_.asInstanceOf[Trace])
+    val zTrace            = fiberId.zipWith(Gen.chunkOf(zTraceElement))(StackTrace(_, _))
+    val failure           = e.zipWith(zTrace)(Cause.fail(_, _))
+    val die               = t.zipWith(zTrace)(Cause.die(_, _))
+    val empty             = Gen.const(Cause.empty)
+    val interrupt         = fiberId.zipWith(zTrace)(Cause.interrupt(_, _))
+    def stackless(n: Int) = Gen.suspend(causesN(n - 1).flatMap(c => Gen.elements(Cause.stack(c), Cause.stackless(c))))
 
     def sequential(n: Int) = Gen.suspend {
       for {
@@ -50,8 +54,8 @@ trait GenZIO {
 
     def causesN(n: Int): Gen[R, Cause[E]] = Gen.suspend {
       if (n == 1) Gen.oneOf(empty, failure, die, interrupt)
-      else if (n == 2) Gen.oneOf(traced(n), meta(n))
-      else Gen.oneOf(traced(n), meta(n), sequential(n), parallel(n))
+      else if (n == 2) stackless(n)
+      else Gen.oneOf(stackless(n), sequential(n), parallel(n))
     }
 
     Gen.small(causesN, 1)
@@ -61,14 +65,18 @@ trait GenZIO {
    * A generator of effects that are the result of chaining the specified effect
    * with itself a random number of times.
    */
-  final def chained[R <: Random with Sized, Env, E, A](gen: Gen[R, ZIO[Env, E, A]]): Gen[R, ZIO[Env, E, A]] =
+  final def chained[R <: Sized, Env, E, A](gen: Gen[R, ZIO[Env, E, A]])(implicit
+    trace: Trace
+  ): Gen[R, ZIO[Env, E, A]] =
     Gen.small(chainedN(_)(gen))
 
   /**
    * A generator of effects that are the result of chaining the specified effect
    * with itself a given number of times.
    */
-  final def chainedN[R <: Random, Env, E, A](n: Int)(zio: Gen[R, ZIO[Env, E, A]]): Gen[R, ZIO[Env, E, A]] =
+  final def chainedN[R, Env, E, A](n: Int)(zio: Gen[R, ZIO[Env, E, A]])(implicit
+    trace: Trace
+  ): Gen[R, ZIO[Env, E, A]] =
     Gen.listOfN(n min 1)(zio).map(_.reduce(_ *> _))
 
   /**
@@ -76,19 +84,19 @@ trait GenZIO {
    * combinators to the specified effect that are guaranteed not to change its
    * value.
    */
-  final def concurrent[R, E, A](zio: ZIO[R, E, A]): Gen[Any, ZIO[R, E, A]] =
+  final def concurrent[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): Gen[Any, ZIO[R, E, A]] =
     Gen.const(zio.race(ZIO.never))
 
   /**
    * A generator of effects that have died with a `Throwable`.
    */
-  final def died[R](gen: Gen[R, Throwable]): Gen[R, UIO[Nothing]] =
+  final def died[R](gen: Gen[R, Throwable])(implicit trace: Trace): Gen[R, UIO[Nothing]] =
     gen.map(ZIO.die(_))
 
   /**
    * A generator of effects that have failed with an error.
    */
-  final def failures[R, E](gen: Gen[R, E]): Gen[R, IO[E, Nothing]] =
+  final def failures[R, E](gen: Gen[R, E])(implicit trace: Trace): Gen[R, IO[E, Nothing]] =
     gen.map(ZIO.fail(_))
 
   /**
@@ -96,12 +104,12 @@ trait GenZIO {
    * combinators to the specified effect that are guaranteed not to change its
    * value.
    */
-  final def parallel[R, E, A](zio: ZIO[R, E, A]): Gen[Any, ZIO[R, E, A]] =
+  final def parallel[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): Gen[Any, ZIO[R, E, A]] =
     successes(Gen.unit).map(_.zipParRight(zio))
 
   /**
    * A generator of successful effects.
    */
-  final def successes[R, A](gen: Gen[R, A]): Gen[R, UIO[A]] =
+  final def successes[R, A](gen: Gen[R, A])(implicit trace: Trace): Gen[R, UIO[A]] =
     gen.map(ZIO.succeedNow)
 }

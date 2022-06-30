@@ -17,6 +17,7 @@
 package zio.internal
 
 import zio.{Chunk, ChunkBuilder}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * A bounded hub of arbitrary capacity backed by an array.
@@ -49,7 +50,7 @@ private final class BoundedHubArb[A](requestedCapacity: Int) extends Hub[A] {
       true
     }
 
-  def publishAll(as: Iterable[A]): Chunk[A] = {
+  def publishAll[A1 <: A](as: Iterable[A1]): Chunk[A1] = {
     val n         = as.size
     val size      = (publisherIndex - subscribersIndex).toInt
     val available = capacity - size

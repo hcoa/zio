@@ -1,9 +1,7 @@
 package zio.test
 
-import zio.duration.durationInt
+import zio._
 import zio.test.SmartTestTypes._
-import zio.test.environment.TestClock
-import zio.{Cause, Chunk, Exit, Fiber, NonEmptyChunk}
 
 import java.time.LocalDateTime
 import scala.collection.immutable.SortedSet
@@ -19,7 +17,7 @@ object SmartAssertionSpec extends ZIOBaseSpec {
 
   private val company: Company = Company("Ziverge", List(User("Bobo", List.tabulate(2)(n => Post(s"Post #$n")))))
 
-  def spec: ZSpec[Environment, Failure] = suite("SmartAssertionSpec")(
+  def spec = suite("SmartAssertionSpec")(
     suite("Array")(
       suite("==")(
         test("success") {
@@ -62,11 +60,6 @@ object SmartAssertionSpec extends ZIOBaseSpec {
       val list = List(10, 5, 8, 3, 4)
       assertTrue(list.forall(_ % 2 == 0))
     } @@ failing,
-    test("right.get") {
-      val myEither: Either[String, Int] = Left("string")
-      case class Cool(int: Int)
-      assertTrue(myEither.right.get + 1 > 18)
-    } @@ failing,
     test("string contains") {
       val myString = "something"
       assertTrue(myString.contains("aoseunoth") && myString == "coool")
@@ -84,18 +77,12 @@ object SmartAssertionSpec extends ZIOBaseSpec {
         assertTrue(array.head == 3)
       },
       test("Object constructor") {
-        assertTrue(zio.duration.Duration.fromNanos(1000) == zio.duration.Duration.Zero)
+        assertTrue(zio.Duration.fromNanos(1000) == zio.Duration.Zero)
       }
     ) @@ failing,
     suite("contains")(
       test("Option") {
         assertTrue(company.users.head.posts.head.publishDate.contains(LocalDateTime.MAX))
-      }
-    ) @@ failing,
-    suite("Either")(
-      test("right.get") {
-        val myEither: Either[String, Int] = Left("string")
-        assertTrue(myEither.right.get + 1 > 11233)
       }
     ) @@ failing,
     suite("Exceptions")(
@@ -145,7 +132,7 @@ object SmartAssertionSpec extends ZIOBaseSpec {
       val list = Some(List(1, 8, 132, 83))
       assertTrue(list.get.contains(78))
     } @@ failing,
-    testM("sleep delays effect until time is adjusted") {
+    test("sleep delays effect until time is adjusted") {
       for {
         ref    <- zio.Ref.make(false)
         _      <- ref.set(true).delay(10.hours).fork
@@ -172,7 +159,7 @@ object SmartAssertionSpec extends ZIOBaseSpec {
       assertTrue("Howdy".endsWith("no"))
     } @@ failing,
     test("duration equality") {
-      assertTrue(zio.duration.Duration.fromNanos(1000) == zio.duration.Duration.Zero)
+      assertTrue(zio.Duration.fromNanos(1000) == zio.Duration.Zero)
     } @@ failing,
     test("string contains") {
       assertTrue("FUNNY HOUSE".contains("OH NO"))
@@ -287,8 +274,8 @@ object SmartAssertionSpec extends ZIOBaseSpec {
     test("hasAt must fail when an index is outside of a sequence range") {
       assertTrue(!(Seq(1, 2, 3)(2) == 3))
     } @@ failing,
-    testM("check") {
-      check(Gen.anyInt) { int =>
+    test("check") {
+      check(Gen.int) { int =>
         assertTrue(int < 800)
       }
     } @@ failing,
@@ -337,10 +324,27 @@ object SmartAssertionSpec extends ZIOBaseSpec {
         val l1 = Seq("Alpha", "This is a wonderful way to dance and party", "Potato")
         val l2 = Seq("Alpha", "This is a wonderful way to live and die", "Potato", "Bruce Lee", "Potato", "Ziverge")
         assertTrue(l1 == l2)
-      } @@ failing
+      } @@ failing,
+      suite("String diffs")(
+        test("words") {
+          val s1 = "This is a wonderful way to dance and party"
+          val s2 = "This is a wonderful way to live and die"
+          assertTrue(s1 == s2)
+        } @@ failing,
+        test("characters") {
+          val s1 = "abcdefghijklmnopqrstuvwxyz"
+          val s2 = "abCdefghiiJklmnopqrstuvwxyzZ"
+          assertTrue(s1 == s2)
+        } @@ failing,
+        test("multi-line") {
+          val s1 = "Hello\nThis is a wonderful way to dance and party\nThis is a wonderful way to live and die"
+          val s2 = "Hello\nThis is a wonderful way to live and die\nThis is a wonderful way to dance and party"
+          assertTrue(s1 == s2)
+        } @@ failing
+      )
     ),
     test("Package qualified identifiers") {
-      assertTrue(zio.duration.Duration.fromNanos(0) == zio.duration.Duration.Zero)
+      assertTrue(zio.Duration.fromNanos(0) == zio.Duration.Zero)
     },
     suite("isInstanceOf")(
       test("success") {
@@ -393,7 +397,7 @@ object SmartAssertionSpec extends ZIOBaseSpec {
           assertTrue(cause.is(_.failure) == "UH OH")
         },
         test("interrupted") {
-          val cause: Cause[Int] = Cause.interrupt(Fiber.Id(123, 1))
+          val cause: Cause[Int] = Cause.interrupt(FiberId(123, 1, Trace.empty))
           assertTrue(!cause.is(_.interrupted))
         }
       ),
@@ -407,7 +411,7 @@ object SmartAssertionSpec extends ZIOBaseSpec {
           assertTrue(exit.is(_.failure) == 88)
         },
         test("interrupted") {
-          val exit: Exit[Int, String] = Exit.interrupt(Fiber.Id(123, 1))
+          val exit: Exit[Int, String] = Exit.interrupt(FiberId(123, 1, Trace.empty))
           assertTrue(!exit.is(_.interrupted))
         },
         test("success") {
@@ -478,6 +482,12 @@ object SmartAssertionSpec extends ZIOBaseSpec {
         customAssertion("hello")
       } @@ failing
     ),
+    suite("null")(
+      test("does not blow up the renderer") {
+        final case class Foo(string: String, int: Int)
+        assertTrue(Foo(null, 1) == Foo("a", 1))
+      } @@ failing
+    ),
     suite("miscellaneous issues") {
       test("implicit Diff between Option[Nothing] and None is resolved") {
         val option: Option[Nothing] = Option.empty
@@ -486,10 +496,10 @@ object SmartAssertionSpec extends ZIOBaseSpec {
     }
   )
 
-  // The implicit SourceLocation will be used by assertTrue to report the
+  // The implicit trace will be used by assertTrue to report the
   // actual location.
-  def customAssertion(string: String)(implicit sourceLocation: SourceLocation): Assert =
-    assertTrue(string == "coool")
+  def customAssertion(string: String)(implicit trace: Trace): TestResult =
+    assertTrue(string == "cool")
 
   // Test Types
   sealed private trait Color

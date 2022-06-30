@@ -16,7 +16,8 @@
 
 package zio.stm
 
-import zio.{BuildFrom, CanFail, Fiber, IO, NonEmptyChunk}
+import zio.{BuildFrom, CanFail, FiberId, IO, NonEmptyChunk, Trace}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import scala.util.Try
 
@@ -33,8 +34,15 @@ object STM {
    * @see
    *   See [[zio.stm.ZSTM.atomically]]
    */
-  def atomically[E, A](stm: STM[E, A]): IO[E, A] =
+  def atomically[E, A](stm: STM[E, A])(implicit trace: Trace): IO[E, A] =
     ZSTM.atomically(stm)
+
+  /**
+   * @see
+   *   See [[zio.stm.ZSTM.partition]]
+   */
+  def attempt[A](a: => A): STM[Throwable, A] =
+    ZSTM.attempt(a)
 
   /**
    * @see
@@ -61,10 +69,10 @@ object STM {
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.collectAll_]]
+   *   See [[zio.stm.ZSTM.collectAllDiscard]]
    */
-  def collectAll_[E, A](in: Iterable[STM[E, A]]): STM[E, Unit] =
-    ZSTM.collectAll_(in)
+  def collectAllDiscard[E, A](in: Iterable[STM[E, A]]): STM[E, Unit] =
+    ZSTM.collectAllDiscard(in)
 
   /**
    * @see
@@ -119,7 +127,7 @@ object STM {
    * @see
    *   See [[zio.stm.ZSTM.fiberId]]
    */
-  val fiberId: USTM[Fiber.Id] =
+  val fiberId: USTM[FiberId] =
     ZSTM.fiberId
 
   /**
@@ -201,10 +209,10 @@ object STM {
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.foreach_]]
+   *   See [[zio.stm.ZSTM.foreachDiscard]]
    */
-  def foreach_[E, A](in: Iterable[A])(f: A => STM[E, Any]): STM[E, Unit] =
-    ZSTM.foreach_(in)(f)
+  def foreachDiscard[E, A](in: Iterable[A])(f: A => STM[E, Any]): STM[E, Unit] =
+    ZSTM.foreachDiscard(in)(f)
 
   /**
    * @see
@@ -212,20 +220,6 @@ object STM {
    */
   def fromEither[E, A](e: => Either[E, A]): STM[E, A] =
     ZSTM.fromEither(e)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.fromFunction]]
-   */
-  def fromFunction[A](f: Any => A): USTM[A] =
-    ZSTM.fromFunction(f)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.fromFunctionM]]
-   */
-  def fromFunctionM[E, A](f: Any => STM[E, A]): STM[E, A] =
-    ZSTM.fromFunctionM(f)
 
   /**
    * @see
@@ -243,16 +237,10 @@ object STM {
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.identity]]
+   *   See [[zio.stm.ZSTM.ifSTM]]
    */
-  def identity: USTM[Any] = ZSTM.identity
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.ifM]]
-   */
-  def ifM[E](b: STM[E, Boolean]): ZSTM.IfM[Any, E] =
-    ZSTM.ifM(b)
+  def ifSTM[E](b: STM[E, Boolean]): ZSTM.IfSTM[Any, E] =
+    ZSTM.ifSTM(b)
 
   /**
    * @see
@@ -277,35 +265,10 @@ object STM {
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.loop_]]
+   *   See [[zio.stm.ZSTM.loopDiscard]]
    */
-  def loop_[E, S](initial: S)(cont: S => Boolean, inc: S => S)(body: S => STM[E, Any]): STM[E, Unit] =
-    ZSTM.loop_(initial)(cont, inc)(body)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.mapN[R,E,A,B,C]*]]
-   */
-  def mapN[E, A, B, C](tx1: STM[E, A], tx2: STM[E, B])(f: (A, B) => C): STM[E, C] =
-    ZSTM.mapN(tx1, tx2)(f)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.mapN[R,E,A,B,C,D]*]]
-   */
-  def mapN[E, A, B, C, D](tx1: STM[E, A], tx2: STM[E, B], tx3: STM[E, C])(
-    f: (A, B, C) => D
-  ): STM[E, D] =
-    ZSTM.mapN(tx1, tx2, tx3)(f)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.mapN[R,E,A,B,C,D,F]*]]
-   */
-  def mapN[E, A, B, C, D, F](tx1: STM[E, A], tx2: STM[E, B], tx3: STM[E, C], tx4: STM[E, D])(
-    f: (A, B, C, D) => F
-  ): STM[E, F] =
-    ZSTM.mapN(tx1, tx2, tx3, tx4)(f)
+  def loopDiscard[E, S](initial: S)(cont: S => Boolean, inc: S => S)(body: S => STM[E, Any]): STM[E, Unit] =
+    ZSTM.loopDiscard(initial)(cont, inc)(body)
 
   /**
    * @see
@@ -320,13 +283,6 @@ object STM {
    *   See [[zio.stm.ZSTM.none]]
    */
   val none: USTM[Option[Nothing]] = ZSTM.none
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.partition]]
-   */
-  def partial[A](a: => A): STM[Throwable, A] =
-    ZSTM.partial(a)
 
   /**
    * @see
@@ -354,24 +310,17 @@ object STM {
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.replicate]]
+   *   See [[zio.stm.ZSTM.replicateSTM]]
    */
-  def replicateM[E, A](n: Int)(transaction: STM[E, A]): STM[E, Iterable[A]] =
-    ZSTM.replicateM(n)(transaction)
+  def replicateSTM[E, A](n: Int)(transaction: STM[E, A]): STM[E, Iterable[A]] =
+    ZSTM.replicateSTM(n)(transaction)
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.replicate]]
+   *   See [[zio.stm.ZSTM.replicateSTMDiscard]]
    */
-  def replicateM_[E, A](n: Int)(transaction: STM[E, A]): STM[E, Unit] =
-    ZSTM.replicateM_(n)(transaction)
-
-  /**
-   * @see
-   *   See [[zio.stm.ZSTM.require]]
-   */
-  def require[E, A](error: => E): STM[E, Option[A]] => STM[E, A] =
-    ZSTM.require[Any, E, A](error)
+  def replicateSTMDiscard[E, A](n: Int)(transaction: STM[E, A]): STM[E, Unit] =
+    ZSTM.replicateSTMDiscard(n)(transaction)
 
   /**
    * @see
@@ -419,15 +368,15 @@ object STM {
    * @see
    *   See [[zio.stm.ZSTM.unless]]
    */
-  def unless[E](b: => Boolean)(stm: => STM[E, Any]): STM[E, Unit] =
+  def unless[E, A](b: => Boolean)(stm: => STM[E, A]): STM[E, Option[A]] =
     ZSTM.unless(b)(stm)
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.unlessM]]
+   *   See [[zio.stm.ZSTM.unlessSTM]]
    */
-  def unlessM[E](b: STM[E, Boolean]): ZSTM.UnlessM[Any, E] =
-    ZSTM.unlessM(b)
+  def unlessSTM[E](b: STM[E, Boolean]): ZSTM.UnlessSTM[Any, E] =
+    ZSTM.unlessSTM(b)
 
   /**
    * @see
@@ -461,28 +410,29 @@ object STM {
    * @see
    *   See [[zio.stm.ZSTM.when]]
    */
-  def when[E](b: => Boolean)(stm: => STM[E, Any]): STM[E, Unit] = ZSTM.when(b)(stm)
+  def when[E, A](b: => Boolean)(stm: => STM[E, A]): STM[E, Option[A]] =
+    ZSTM.when(b)(stm)
 
   /**
    * @see
    *   See [[zio.stm.ZSTM.whenCase]]
    */
-  def whenCase[E, A](a: => A)(pf: PartialFunction[A, STM[E, Any]]): STM[E, Unit] =
+  def whenCase[E, A, B](a: => A)(pf: PartialFunction[A, STM[E, B]]): STM[E, Option[B]] =
     ZSTM.whenCase(a)(pf)
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.whenCaseM]]
+   *   See [[zio.stm.ZSTM.whenCaseSTM]]
    */
-  def whenCaseM[E, A](a: STM[E, A])(pf: PartialFunction[A, STM[E, Any]]): STM[E, Unit] =
-    ZSTM.whenCaseM(a)(pf)
+  def whenCaseSTM[E, A, B](a: STM[E, A])(pf: PartialFunction[A, STM[E, B]]): STM[E, Option[B]] =
+    ZSTM.whenCaseSTM(a)(pf)
 
   /**
    * @see
-   *   See [[zio.stm.ZSTM.whenM]]
+   *   See [[zio.stm.ZSTM.whenSTM]]
    */
-  def whenM[E](b: STM[E, Boolean]): ZSTM.WhenM[Any, E] =
-    ZSTM.whenM(b)
+  def whenSTM[E](b: STM[E, Boolean]): ZSTM.WhenSTM[Any, E] =
+    ZSTM.whenSTM(b)
 
   private[zio] def succeedNow[A](a: A): USTM[A] =
     ZSTM.succeedNow(a)

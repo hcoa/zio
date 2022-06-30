@@ -17,85 +17,58 @@
 package zio.internal
 
 import zio.Fiber.Dump
-import zio.Fiber.Status.{Done, Finishing, Running, Suspended}
-import zio.{Fiber, UIO, ZIO}
+import zio.Fiber.Status.{Done, Running, Suspended}
+import zio.{Fiber, FiberId, RuntimeFlag, RuntimeFlags, UIO, ZIO, Trace}
+import zio.internal.stacktracer.Tracer
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 private[zio] object FiberRenderer {
+  def prettyPrint(dump: Fiber.Dump)(implicit trace: Trace): UIO[String] =
+    ZIO.succeed(unsafePrettyPrint(dump, System.currentTimeMillis()))
 
-  def dumpStr(fibers: Seq[Fiber.Runtime[_, _]], withTrace: Boolean): UIO[String] =
-    for {
-      dumps <- ZIO.foreach(fibers)(f => f.dumpWith(withTrace))
-      now   <- UIO(System.currentTimeMillis())
-    } yield {
-      val treeString  = renderHierarchy(dumps)
-      val dumpStrings = if (withTrace) collectTraces(dumps, now) else Seq.empty
-      (treeString +: dumpStrings).mkString("\n")
-    }
+  private def unsafePrettyPrint(dump: Fiber.Dump, now: Long): String = {
+    val totalMillis = (now - dump.fiberId.startTimeMillis)
+    val millis      = totalMillis % 1000
+    val seconds     = totalMillis / 1000L
+    val minutes     = seconds / 60L
+    val hours       = minutes / 60L
 
-  def prettyPrintM(dump: Fiber.Dump): UIO[String] =
-    UIO(prettyPrint(dump, System.currentTimeMillis()))
-
-  private def zipWithHasNext[A](it: Iterable[A]): Iterable[(A, Boolean)] =
-    if (it.isEmpty)
-      Seq.empty
-    else {
-      Iterable.concat(it.dropRight(1).map((_, true)), Seq((it.last, false)))
-    }
-
-  private def prettyPrint(dump: Fiber.Dump, now: Long): String = {
-    val millis  = (now - dump.fiberId.startTimeMillis)
-    val seconds = millis / 1000L
-    val minutes = seconds / 60L
-    val hours   = minutes / 60L
-
-    val name = dump.fiberName.fold("")(name => "\"" + name + "\" ")
-    val lifeMsg = (if (hours == 0) "" else s"${hours}h") +
-      (if (hours == 0 && minutes == 0) "" else s"${minutes}m") +
-      (if (hours == 0 && minutes == 0 && seconds == 0) "" else s"${seconds}s") +
+    val name = "\"" + dump.fiberId.threadName + "\""
+    val lifeMsg = (if (hours == 0) "" else s"${hours}h ") +
+      (if (hours == 0 && minutes == 0) "" else s"${minutes}m ") +
+      (if (hours == 0 && minutes == 0 && seconds == 0) "" else s"${seconds}s ") +
       (s"${millis}ms")
     val waitMsg = dump.status match {
-      case Suspended(_, _, _, blockingOn, _) =>
-        if (blockingOn.nonEmpty)
-          "waiting on " + blockingOn.map(id => s"#${id.seqNumber}").mkString(", ")
-        else ""
+      case Suspended(_, _, blockingOn) =>
+        if (blockingOn ne FiberId.None) "waiting on " + s"#${blockingOn.ids.mkString(", ")}" else ""
       case _ => ""
     }
     val statMsg = renderStatus(dump.status)
 
     s"""
-       |$name#${dump.fiberId.seqNumber} ($lifeMsg) $waitMsg
-       |   Status: $statMsg
-       |${dump.trace.fold("")(_.prettyPrint)}
+       |${name} ($lifeMsg) $waitMsg
+       |\tStatus: $statMsg
+       |${dump.trace.prettyPrint}
        |""".stripMargin
   }
 
+  private def renderFlags(runtimeFlags: RuntimeFlags): String =
+    RuntimeFlags.toSet(runtimeFlags).mkString("(", ", ", ")")
+
+  private def renderTrace(trace: Trace): String =
+    if (trace == Trace.empty) "<no trace>" else trace.toString()
+
   private def renderStatus(status: Fiber.Status): String =
     status match {
-      case Done         => "Done"
-      case Finishing(b) => "Finishing(" + (if (b) "interrupting" else "") + ")"
-      case Running(b)   => "Running(" + (if (b) "interrupting" else "") + ")"
-      case Suspended(_, interruptible, epoch, _, asyncTrace) =>
-        val in = if (interruptible) "interruptible" else "uninterruptible"
-        val ep = s"$epoch asyncs"
-        val as = asyncTrace.map(_.prettyPrint).getOrElse("")
-        s"Suspended($in, $ep, $as)"
+      case Done => "Done"
+      case Running(runtimeFlags, trace0) =>
+        val flags = renderFlags(runtimeFlags)
+        val trace = renderTrace(trace0)
+        s"Running(${flags}, ${trace})"
+      case Suspended(runtimeFlags, trace0, blockingOn) =>
+        val flags = renderFlags(runtimeFlags)
+        val trace = renderTrace(trace0)
+        s"Suspended($flags, $trace)"
     }
 
-  private def renderHierarchy(trees: Iterable[Dump]): String =
-    zipWithHasNext(trees).map { case (tree, _) =>
-      renderOne(tree)
-    }.mkString
-
-  private def renderOne(tree: Dump): String = {
-    def go(t: Dump, prefix: String): String = {
-      val nameStr   = t.fiberName.fold("")(n => "\"" + n + "\" ")
-      val statusMsg = renderStatus(t.status)
-      s"$prefix+---$nameStr#${t.fiberId.seqNumber} Status: $statusMsg\n"
-    }
-
-    go(tree, "")
-  }
-
-  private def collectTraces(dumps: Iterable[Dump], now: Long): Vector[String] =
-    dumps.map(prettyPrint(_, now)).toVector
 }

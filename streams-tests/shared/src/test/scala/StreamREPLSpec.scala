@@ -1,20 +1,17 @@
 import com.github.ghik.silencer.silent
 import zio.test._
 
-object StreamREPLSpec extends DefaultRunnableSpec {
+object StreamREPLSpec extends ZIOSpecDefault {
 
-  @silent("Unused import")
-  def spec: ZSpec[Environment, Failure] = suite("StreamREPLSpec")(
+  def spec = suite("StreamREPLSpec")(
     test("settings compile") {
-      import zio.Runtime.default._
       import zio._
-      import zio.console._
-      import zio.duration._
-      import zio.stream._
       @silent("never used")
-      implicit class RunSyntax[A](io: ZIO[ZEnv, Any, A]) {
+      implicit class RunSyntax[A](io: ZIO[Any, Any, A]) {
         def unsafeRun: A =
-          Runtime.default.unsafeRun(io.provideLayer(ZEnv.live))
+          Unsafe.unsafe { implicit unsafe =>
+            Runtime.default.unsafe.run(io).getOrThrowFiberFailure()
+          }
       }
       assertCompletes
     }

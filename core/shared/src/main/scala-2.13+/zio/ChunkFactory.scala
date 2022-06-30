@@ -16,13 +16,19 @@
 
 package zio
 
-private[zio] trait ChunkFactory {
-  def apply[A](as: A*): Chunk[A]
-  def fill[A](n: Int)(elem: => A): Chunk[A]
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
-  /**
-   * Extracts the elements from a `Chunk`.
-   */
-  def unapplySeq[A](chunk: Chunk[A]): Some[Chunk[A]] =
-    Some(chunk)
+import scala.collection.{IterableOnce, StrictOptimizedSeqFactory}
+import scala.collection.mutable.Builder
+
+private[zio] trait ChunkFactory extends StrictOptimizedSeqFactory[Chunk] {
+
+  final def from[A](source: IterableOnce[A]): Chunk[A] =
+    source match {
+      case iterable: Iterable[A] => Chunk.fromIterable(iterable)
+      case iterableOnce =>
+        val chunkBuilder = ChunkBuilder.make[A]()
+        iterableOnce.iterator.foreach(chunkBuilder.addOne)
+        chunkBuilder.result()
+    }
 }

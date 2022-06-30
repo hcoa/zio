@@ -8,7 +8,7 @@ title:  "Sample Projects"
 - [ZIO Modern Backend giter8 Template - Tapir, sttp, http4s](https://github.com/Anadyne/zio-full-backend.g8) by [Boris V.Kuznetsov](https://github.com/tampler)
 - [ZIO CRUD sample - Code for the 'Spring to ZIO 101' blog post 03/2020](https://github.com/adrianfilip/zio-crud-sample) by [Adrian Filip](https://github.com/adrianfilip)
 - [ZIO modules with different implementations - Code for the 'Decouple the Program from its Implementation...' blog post 12/2019](https://github.com/pme123/zio-comps-module) by [pme123](https://github.com/pme123)
-- [TicTacToe command line game using Module Pattern](https://github.com/ioleo/zio-by-example) by [ioleo](https://github.com/ioleo)
+- [TicTacToe command line game using Service Pattern](https://github.com/ioleo/zio-by-example) by [ioleo](https://github.com/ioleo)
 - [Long Polling with ZIO - Code for the 'What can ZIO do for me?' blog post 11/2019](https://github.com/pme123/zio-http4s-long-polling) by [pme123](https://github.com/pme123)
 - [Hello world with ZIO and http4s](https://gitlab.com/maplambda/zio-http4s) by [maplambda](https://gitlab.com/maplambda)
 - [STM Partitioning - Code for the 'Exploring the STM functionality in ZIO' blog post](https://github.com/freskog/stm-partitioning)
@@ -26,3 +26,4 @@ title:  "Sample Projects"
 - [ZIO Tapir Http4s Integration](https://github.com/Neurodyne/zio-tapir) by [Boris V.Kuznetsov](https://github.com/tampler)
 - [Akka Microservice using DDD with ZIO Streams Tapir AkkaHTTP Integration](https://github.com/mvillafuertem/scalcite) by [Miguel Villafuerte](https://github.com/mvillafuertem)
 - [Simple ZIO ScalaJS Skeleton](https://github.com/sb-dev/zio-scalajs) by [Samir Benzenine](https://github.com/sb-dev)
+- [Full ZIO Stack: A sample IM that uses zio, zio-redis, zio-actors, zio-schema, zio-streams, zio-crypto, tapir, akka-http](https://github.com/bitlap/zim) by [bitlap](https://github.com/bitlap/zim) (Notes in Chinese)

@@ -7,7 +7,7 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
   import ReentrantLock.State
 
   /** Queries whether the given fiber is waiting to acquire this lock. */
-  def hasQueuedFiber(fiberId: Fiber.Id): UIO[Boolean] =
+  def hasQueuedFiber(fiberId: FiberId): UIO[Boolean] =
     state.get.map(_.waiters.contains(fiberId))
 
   /** Queries whether any fibers are waiting to acquire this lock. */
@@ -52,9 +52,9 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
     (ZIO.fiberId <*> Promise.make[Nothing, Unit]).flatMap { case (fiberId, p) =>
       state.modify {
         case State(ep, None, _, _) =>
-          UIO.unit -> State(ep + 1, Some(fiberId), 1, Map.empty)
+          ZIO.unit -> State(ep + 1, Some(fiberId), 1, Map.empty)
         case State(ep, Some(`fiberId`), cnt, waiters) =>
-          UIO.unit -> State(ep + 1, Some(fiberId), cnt + 1, waiters)
+          ZIO.unit -> State(ep + 1, Some(fiberId), cnt + 1, waiters)
         case State(ep, holder, cnt, waiters) =>
           p.await.onInterrupt(_ => cleanupWaiter(fiberId)).unit -> State(
             ep + 1,
@@ -73,13 +73,13 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
    * Returns the fiber ID of the fiber that currently owns this lock, if owned,
    * or None otherwise.
    */
-  lazy val owner: UIO[Option[Fiber.Id]] =
+  lazy val owner: UIO[Option[FiberId]] =
     state.get.map(_.holder)
 
   /**
    * Returns the fiber IDs of the fibers that are waiting to acquire this lock.
    */
-  lazy val queuedFibers: UIO[List[Fiber.Id]] =
+  lazy val queuedFibers: UIO[List[FiberId]] =
     state.get.map(_.waiters.keys.toList)
 
   /** Returns the number of fibers waiting to acquire this lock. */
@@ -115,27 +115,27 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
         case State(ep, Some(`fiberId`), 1, holders) =>
           relock(ep, holders)
         case State(ep, Some(`fiberId`), cnt, holders) =>
-          UIO.unit -> State(ep, Some(fiberId), cnt - 1, holders)
+          ZIO.unit -> State(ep, Some(fiberId), cnt - 1, holders)
         case otherwise =>
-          UIO.unit -> otherwise
+          ZIO.unit -> otherwise
       }.flatten
     }
 
   /** Acquires and releases the lock as a managed effect. */
-  lazy val withLock: UManaged[Int] =
-    ZManaged.makeInterruptible(lock *> holdCount)(_ => unlock)
+  lazy val withLock: URIO[Scope, Int] =
+    ZIO.acquireReleaseInterruptible(lock *> holdCount)(unlock)
 
-  private def relock(epoch: Long, holders: Map[Fiber.Id, (Long, Promise[Nothing, Unit])]): (UIO[Unit], State) =
+  private def relock(epoch: Long, holders: Map[FiberId, (Long, Promise[Nothing, Unit])]): (UIO[Unit], State) =
     if (holders.isEmpty)
-      UIO.unit -> State(epoch + 1, None, 0, Map.empty)
+      ZIO.unit -> State(epoch + 1, None, 0, Map.empty)
     else {
       val (fiberId, (_, promise)) = if (fairness) holders.minBy(_._2._1) else pickRandom(holders)
       promise.succeed(()).unit -> State(epoch + 1, Some(fiberId), 1, holders - fiberId)
     }
 
   private def pickRandom(
-    holders: Map[Fiber.Id, (Long, Promise[Nothing, Unit])]
-  ): (Fiber.Id, (Long, Promise[Nothing, Unit])) = {
+    holders: Map[FiberId, (Long, Promise[Nothing, Unit])]
+  ): (FiberId, (Long, Promise[Nothing, Unit])) = {
     val n  = Random.nextInt(holders.size)
     val it = holders.iterator
     var i  = 0
@@ -148,7 +148,7 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
     it.next()
   }
 
-  private def cleanupWaiter(fiberId: Fiber.Id): UIO[Any] =
+  private def cleanupWaiter(fiberId: FiberId): UIO[Any] =
     state.update { case State(ep, holder, cnt, waiters) =>
       State(ep, holder, cnt, waiters - fiberId)
     }
@@ -157,13 +157,13 @@ final class ReentrantLock private (fairness: Boolean, state: Ref[ReentrantLock.S
 
 object ReentrantLock {
   def make(fairness: Boolean = false): UIO[ReentrantLock] =
-    ZRef.make(State.empty).map(new ReentrantLock(fairness, _))
+    Ref.make(State.empty).map(new ReentrantLock(fairness, _))
 
   private case class State(
     epoch: Long,
-    holder: Option[Fiber.Id],
+    holder: Option[FiberId],
     holdCount: Int,
-    waiters: Map[Fiber.Id, (Long, Promise[Nothing, Unit])]
+    waiters: Map[FiberId, (Long, Promise[Nothing, Unit])]
   )
 
   private object State {

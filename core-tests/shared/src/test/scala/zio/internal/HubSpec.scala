@@ -1,14 +1,13 @@
 package zio.internal
 
-import zio.random.Random
 import zio.test.Assertion._
 import zio.test._
-import zio.test.environment._
-import zio.{Hub => _, _}
+import zio.{Hub => _}
+import zio.{Chunk, UIO, ZIO, ZIOBaseSpec, Hub => _}
 
 object HubSpec extends ZIOBaseSpec {
 
-  def spec: ZSpec[Environment, Failure] =
+  def spec =
     suite("HubSpec")(
       suite("pow2")(
         basicOperationsPow2,
@@ -63,11 +62,11 @@ object HubSpec extends ZIOBaseSpec {
       )
     )
 
-  val smallInt: Gen[Random, Int] =
+  val smallInt: Gen[Any, Int] =
     Gen.int(1, 10)
 
   def offerAll[A](hub: Hub[A], values: List[A]): UIO[Unit] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       values match {
         case h :: t =>
           if (hub.publish(h)) offerAll(hub, t)
@@ -77,7 +76,7 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def offerAllChunks[A](hub: Hub[A], chunks: List[Chunk[A]]): UIO[Unit] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       chunks match {
         case h :: t =>
           val remaining = hub.publishAll(h)
@@ -88,7 +87,7 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def takeN[A](subscription: Hub.Subscription[A], n: Int, acc: List[A] = List.empty): UIO[List[A]] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       if (n <= 0) ZIO.succeed(acc.reverse)
       else {
         val a = subscription.poll(null.asInstanceOf[A])
@@ -103,7 +102,7 @@ object HubSpec extends ZIOBaseSpec {
     chunkSize: Int,
     acc: List[A] = List.empty
   ): UIO[List[A]] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       if (n <= 0) ZIO.succeed(acc.reverse)
       else {
         val as        = subscription.pollUpTo(chunkSize)
@@ -114,7 +113,7 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def offerAll_[A](hub: Hub[A], values: List[A]): UIO[Unit] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       values match {
         case h :: t =>
           if (hub.publish(h)) offerAll(hub, t)
@@ -124,7 +123,7 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def takeN_[A](subscription: Hub.Subscription[A], n: Int, acc: List[A] = List.empty): UIO[List[A]] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       if (n <= 0) ZIO.succeed(acc.reverse)
       else {
         val a = subscription.poll(null.asInstanceOf[A])
@@ -134,7 +133,7 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def slidingOffer[A](hub: Hub[A], value: A): UIO[Unit] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       if (hub.publish(value)) {
         ZIO.unit
       } else {
@@ -144,10 +143,10 @@ object HubSpec extends ZIOBaseSpec {
     }
 
   def slidingOfferAll[A](hub: Hub[A], values: List[A]): UIO[Unit] =
-    ZIO.foreach_(values)(slidingOffer(hub, _) *> ZIO.yieldNow)
+    ZIO.foreachDiscard(values)(slidingOffer(hub, _) *> ZIO.yieldNow)
 
   def slidingOfferAllChunks[A](hub: Hub[A], chunks: List[Chunk[A]]): UIO[Unit] =
-    ZIO.effectSuspendTotal {
+    ZIO.suspendSucceed {
       chunks match {
         case h :: t =>
           val remaining = hub.publishAll(h)
@@ -181,28 +180,28 @@ object HubSpec extends ZIOBaseSpec {
     math.pow(2, nextPow.toDouble).toInt.max(2)
   }
 
-  def publishPoll(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def publishPoll(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent publish and poll")(
       publishPoll1To1(makeHub, false),
       publishPoll1ToN(makeHub, false),
       publishPollNToN(makeHub, false)
     )
 
-  def publishPollLimitedCapacity(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def publishPollLimitedCapacity(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("with limited capacity")(
       publishPoll1To1(_ => makeHub(1), false),
       publishPoll1ToN(_ => makeHub(1), false),
       publishPollNToN(_ => makeHub(1), false)
     )
 
-  def publishPollDynamic(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def publishPollDynamic(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("with concurrent subscribes and unsubscribes")(
       publishPoll1To1(_ => makeHub(1), true),
       publishPoll1ToN(_ => makeHub(1), true),
       publishPollNToN(_ => makeHub(1), true)
     )
 
-  def emptyFull(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def emptyFull(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent isEmpty and isFull")(
       isEmpty(makeHub),
       isFull(makeHub),
@@ -210,59 +209,59 @@ object HubSpec extends ZIOBaseSpec {
       publishNonFull(makeHub)
     )
 
-  def publishAllPollUpTo(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def publishAllPollUpTo(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent publishAll and pollUpTo")(
       publishAllPollUpTo1To1(makeHub),
       publishAllPollUpToNToN(makeHub)
     )
 
-  def slidingPublishPoll(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def slidingPublishPoll(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent sliding publish and poll")(
       slidingPublishPoll1To1(makeHub, false),
       slidingPublishPoll1ToN(makeHub, false),
       slidingPublishPollNToN(makeHub, false)
     )
 
-  def slidingPublishPollLimitedCapacity(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def slidingPublishPollLimitedCapacity(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("with limited capacity")(
       slidingPublishPoll1To1(_ => makeHub(1), false),
       slidingPublishPoll1ToN(_ => makeHub(1), false),
       slidingPublishPollNToN(_ => makeHub(1), false)
     )
 
-  def slidingPublishPollDynamic(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def slidingPublishPollDynamic(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("with concurrent subscribes and unsubscribes")(
       slidingPublishPoll1To1(_ => makeHub(1), true),
       slidingPublishPoll1ToN(_ => makeHub(1), true),
       slidingPublishPollNToN(_ => makeHub(1), true)
     )
 
-  def slidingPublishAllPollUpTo(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def slidingPublishAllPollUpTo(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent sliding publishAll and pollUpTo")(
       slidingPublishAllPollUpTo1To1(makeHub),
       slidingPublishAllPollUpToNToN(makeHub)
     )
 
-  def concurrentUnsubscribe(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def concurrentUnsubscribe(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent unsubscribe")(
       concurrentPublishUnsubscribe(makeHub),
       concurrentPollUnsubscribe(makeHub)
     )
 
-  def concurrentPoll(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
+  def concurrentPoll(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
     suite("concurrent poll")(
       poll("with two pollers")(_ => makeHub(1))
     )
 
-  def publishPoll1To1(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and one subscriber") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def publishPoll1To1(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and one subscriber") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub          = makeHub(as.length)
         val subscription = hub.subscribe()
         for {
           publisher  <- offerAll(hub, as).fork
           subscriber <- takeN(subscription, as.length).fork
-          _          <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _          <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           _          <- publisher.join
           values     <- subscriber.join
         } yield assert(values)(equalTo(as)) &&
@@ -273,9 +272,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def publishPoll1ToN(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and two subscribers") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def publishPoll1ToN(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and two subscribers") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub           = makeHub(as.length)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -283,7 +282,7 @@ object HubSpec extends ZIOBaseSpec {
           publisher   <- offerAll(hub, as).fork
           subscriber1 <- takeN(subscription1, as.length).fork
           subscriber2 <- takeN(subscription2, as.length).fork
-          _           <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _           <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           _           <- publisher.join
           values1     <- subscriber1.join
           values2     <- subscriber2.join
@@ -298,9 +297,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def publishPollNToN(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with two publishers and two subscribers") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def publishPollNToN(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with two publishers and two subscribers") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub           = makeHub(as.length * 2)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -309,7 +308,7 @@ object HubSpec extends ZIOBaseSpec {
           publisher2  <- offerAll(hub, as.map(-_)).fork
           subscriber1 <- takeN(subscription1, as.length * 2).fork
           subscriber2 <- takeN(subscription2, as.length * 2).fork
-          _           <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _           <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           _           <- publisher1.join
           _           <- publisher2.join
           values1     <- subscriber1.join
@@ -327,9 +326,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def isEmpty(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("isEmpty always returns false on a subscription that is not empty") {
-      checkM(Gen.listOf(smallInt)) { as =>
+  def isEmpty(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("isEmpty always returns false on a subscription that is not empty") {
+      check(Gen.listOf(smallInt)) { as =>
         val hub           = makeHub(1000)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -339,11 +338,11 @@ object HubSpec extends ZIOBaseSpec {
           publisher2  <- offerAll_(hub, as.map(-_)).fork
           subscriber1 <- takeN(subscription1, as.length).fork
           subscriber2 <- takeN(subscription2, as.length).fork
-          fiber1      <- ZIO.foreach(1 to 100)(_ => ZIO.effectTotal(subscription1.isEmpty())).map(_.forall(a => !a)).fork
-          fiber2      <- ZIO.foreach(1 to 100)(_ => ZIO.effectTotal(subscription2.isEmpty())).map(_.forall(a => !a)).fork
+          fiber1      <- ZIO.foreach(1 to 100)(_ => ZIO.succeed(subscription1.isEmpty())).map(_.forall(a => !a)).fork
+          fiber2      <- ZIO.foreach(1 to 100)(_ => ZIO.succeed(subscription2.isEmpty())).map(_.forall(a => !a)).fork
           _ <- ZIO
-                 .effectTotal(hub.subscribe())
-                 .flatMap(subscription => ZIO.yieldNow *> ZIO.effectTotal(subscription.unsubscribe()))
+                 .succeed(hub.subscribe())
+                 .flatMap(subscription => ZIO.yieldNow *> ZIO.succeed(subscription.unsubscribe()))
           _       <- publisher1.join
           _       <- publisher2.join
           _       <- subscriber1.join
@@ -354,9 +353,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def isFull(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("isFull always returns false on a hub that is not full") {
-      checkM(Gen.listOf(smallInt)) { as =>
+  def isFull(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("isFull always returns false on a hub that is not full") {
+      check(Gen.listOf(smallInt)) { as =>
         val hub           = makeHub(10000)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -365,10 +364,10 @@ object HubSpec extends ZIOBaseSpec {
           publisher2  <- offerAll_(hub, as.map(-_)).fork
           subscriber1 <- takeN(subscription1, as.length).fork
           subscriber2 <- takeN(subscription2, as.length).fork
-          fiber       <- ZIO.foreach(1 to 100)(_ => ZIO.effectTotal(hub.isFull())).map(_.forall(a => !a)).fork
+          fiber       <- ZIO.foreach(1 to 100)(_ => ZIO.succeed(hub.isFull())).map(_.forall(a => !a)).fork
           _ <- ZIO
-                 .effectTotal(hub.subscribe())
-                 .flatMap(subscription => ZIO.yieldNow *> ZIO.effectTotal(subscription.unsubscribe()))
+                 .succeed(hub.subscribe())
+                 .flatMap(subscription => ZIO.yieldNow *> ZIO.succeed(subscription.unsubscribe()))
           _      <- publisher1.join
           _      <- publisher2.join
           _      <- subscriber1.join
@@ -378,9 +377,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def publishNonFull(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("publishing to a hub that is not full always succeeds") {
-      checkM(Gen.listOf(smallInt)) { as =>
+  def publishNonFull(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("publishing to a hub that is not full always succeeds") {
+      check(Gen.listOf(smallInt)) { as =>
         val hub           = makeHub(10000)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -390,8 +389,8 @@ object HubSpec extends ZIOBaseSpec {
           subscriber1 <- takeN(subscription1, as.length).fork
           subscriber2 <- takeN(subscription2, as.length).fork
           _ <- ZIO
-                 .effectTotal(hub.subscribe())
-                 .flatMap(subscription => ZIO.yieldNow *> ZIO.effectTotal(subscription.unsubscribe()))
+                 .succeed(hub.subscribe())
+                 .flatMap(subscription => ZIO.yieldNow *> ZIO.succeed(subscription.unsubscribe()))
           _ <- publisher1.join
           _ <- publisher2.join
           _ <- subscriber1.join
@@ -400,9 +399,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def pollNonEmpty(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("polling from a hub that is not empty always succeeds") {
-      checkM(Gen.listOf(smallInt)) { as =>
+  def pollNonEmpty(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("polling from a hub that is not empty always succeeds") {
+      check(Gen.listOf(smallInt)) { as =>
         val hub           = makeHub(1000)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -413,8 +412,8 @@ object HubSpec extends ZIOBaseSpec {
           subscriber1 <- takeN_(subscription1, as.length * 2).fork
           subscriber2 <- takeN_(subscription2, as.length * 2).fork
           _ <- ZIO
-                 .effectTotal(hub.subscribe())
-                 .flatMap(subscription => ZIO.yieldNow *> ZIO.effectTotal(subscription.unsubscribe()))
+                 .succeed(hub.subscribe())
+                 .flatMap(subscription => ZIO.yieldNow *> ZIO.succeed(subscription.unsubscribe()))
           _ <- publisher1.join
           _ <- publisher2.join
           _ <- subscriber1.join
@@ -423,9 +422,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def publishAllPollUpTo1To1(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and one subscriber") {
-      checkM(Gen.listOf(Gen.chunkOf(smallInt)), smallInt) { (chunks, chunkSize) =>
+  def publishAllPollUpTo1To1(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and one subscriber") {
+      check(Gen.listOf(Gen.chunkOf(smallInt)), smallInt) { (chunks, chunkSize) =>
         val hub          = makeHub(1000)
         val subscription = hub.subscribe()
         for {
@@ -436,9 +435,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def publishAllPollUpToNToN(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with two publishers and two subscribers") {
-      checkM(Gen.listOf(Gen.chunkOf(smallInt)), smallInt) { (chunks, chunkSize) =>
+  def publishAllPollUpToNToN(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with two publishers and two subscribers") {
+      check(Gen.listOf(Gen.chunkOf(smallInt)), smallInt) { (chunks, chunkSize) =>
         val hub           = makeHub(1000)
         val subscription1 = hub.subscribe()
         val subscription2 = hub.subscribe()
@@ -456,9 +455,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def poll(label: String)(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM(label) {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def poll(label: String)(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test(label) {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub          = makeHub(as.length)
         val subscription = hub.subscribe()
         for {
@@ -474,9 +473,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def slidingPublishPoll1To1(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and one subscriber") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def slidingPublishPoll1To1(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and one subscriber") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub          = makeHub(as.length)
         val n            = math.min(hub.capacity, as.length)
         val subscription = hub.subscribe()
@@ -484,16 +483,16 @@ object HubSpec extends ZIOBaseSpec {
         for {
           _          <- slidingOfferAll(hub, as.sorted).fork
           subscriber <- takeN(subscription, n).fork
-          _          <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _          <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           values     <- subscriber.join
         } yield assert(values)(hasSize(equalTo(n))) &&
           assert(values)(isSorted)
       }
     }
 
-  def slidingPublishPoll1ToN(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and two subscribers") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def slidingPublishPoll1ToN(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and two subscribers") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub           = makeHub(as.length)
         val n             = math.min(hub.capacity, as.length)
         val subscription1 = hub.subscribe()
@@ -502,7 +501,7 @@ object HubSpec extends ZIOBaseSpec {
           _           <- slidingOfferAll(hub, as.sorted).fork
           subscriber1 <- takeN(subscription1, n).fork
           subscriber2 <- takeN(subscription2, n).fork
-          _           <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _           <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           values1     <- subscriber1.join
           values2     <- subscriber2.join
         } yield assert(values1)(hasSize(equalTo(n))) &&
@@ -512,9 +511,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def slidingPublishPollNToN(makeHub: Int => Hub[Int], dynamic: Boolean): ZSpec[TestEnvironment, Nothing] =
-    testM("with two publishers and two subscribers") {
-      checkM(Gen.listOf1(smallInt)) { as =>
+  def slidingPublishPollNToN(makeHub: Int => Hub[Int], dynamic: Boolean): Spec[TestEnvironment, Nothing] =
+    test("with two publishers and two subscribers") {
+      check(Gen.listOf1(smallInt)) { as =>
         val hub           = makeHub(as.length * 2)
         val n             = math.min(hub.capacity, as.length)
         val subscription1 = hub.subscribe()
@@ -525,7 +524,7 @@ object HubSpec extends ZIOBaseSpec {
           publisher2  <- slidingOfferAll(hub, as.map(-_).sorted).fork
           subscriber1 <- takeN(subscription1, n).fork
           subscriber2 <- takeN(subscription2, n).fork
-          _           <- ZIO.when(dynamic)(ZIO.effectTotal(hub.subscribe().unsubscribe()))
+          _           <- ZIO.when(dynamic)(ZIO.succeed(hub.subscribe().unsubscribe()))
           _           <- publisher1.join
           _           <- publisher2.join
           values1     <- subscriber1.join
@@ -537,9 +536,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def slidingPublishAllPollUpTo1To1(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with one publisher and one subscriber") {
-      checkM(Gen.listOf(smallInt), smallInt) { (as, chunkSize) =>
+  def slidingPublishAllPollUpTo1To1(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with one publisher and one subscriber") {
+      check(Gen.listOf(smallInt), smallInt) { (as, chunkSize) =>
         val chunks       = as.sorted.grouped(chunkSize).map(Chunk.fromIterable).toList
         val hub          = makeHub(2)
         val n            = math.min(hub.capacity, chunks.flatten.length)
@@ -552,9 +551,9 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def slidingPublishAllPollUpToNToN(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with two publishers and two subscribers") {
-      checkM(Gen.listOf(smallInt), smallInt) { (as, chunkSize) =>
+  def slidingPublishAllPollUpToNToN(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with two publishers and two subscribers") {
+      check(Gen.listOf(smallInt), smallInt) { (as, chunkSize) =>
         val leftChunks    = as.sorted.grouped(chunkSize).map(Chunk.fromIterable).toList
         val rightChunks   = as.map(-_).sorted.grouped(chunkSize).map(Chunk.fromIterable).toList
         val hub           = makeHub(2)
@@ -575,19 +574,19 @@ object HubSpec extends ZIOBaseSpec {
       }
     }
 
-  def concurrentPublishUnsubscribe(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with publish") {
+  def concurrentPublishUnsubscribe(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with publish") {
       val hub          = makeHub(2)
       val subscription = hub.subscribe()
       for {
-        unsubscribe  <- ZIO.effectTotal(subscription.unsubscribe()).fork
-        publish      <- ZIO.effectTotal(hub.publish(1)).fork
+        unsubscribe  <- ZIO.succeed(subscription.unsubscribe()).fork
+        publish      <- ZIO.succeed(hub.publish(1)).fork
         _            <- unsubscribe.join
         _            <- publish.join
-        empty        <- ZIO.effectTotal(hub.isEmpty())
-        full         <- ZIO.effectTotal(hub.isFull())
-        size         <- ZIO.effectTotal(hub.size())
-        subscription <- ZIO.effectTotal(hub.subscribe())
+        empty        <- ZIO.succeed(hub.isEmpty())
+        full         <- ZIO.succeed(hub.isFull())
+        size         <- ZIO.succeed(hub.size())
+        subscription <- ZIO.succeed(hub.subscribe())
         _            <- offerAll(hub, List(2, 3, 4, 5, 6)).fork
         values       <- takeN(subscription, 5)
       } yield assert(empty)(isTrue) &&
@@ -596,20 +595,20 @@ object HubSpec extends ZIOBaseSpec {
         assert(values)(equalTo(List(2, 3, 4, 5, 6)))
     }
 
-  def concurrentPollUnsubscribe(makeHub: Int => Hub[Int]): ZSpec[TestEnvironment, Nothing] =
-    testM("with poll") {
+  def concurrentPollUnsubscribe(makeHub: Int => Hub[Int]): Spec[TestEnvironment, Nothing] =
+    test("with poll") {
       val hub          = makeHub(2)
       val subscription = hub.subscribe()
       hub.publish(1)
       for {
-        unsubscribe  <- ZIO.effectTotal(subscription.unsubscribe()).fork
-        poll         <- ZIO.effectTotal(subscription.poll(-1)).fork
+        unsubscribe  <- ZIO.succeed(subscription.unsubscribe()).fork
+        poll         <- ZIO.succeed(subscription.poll(-1)).fork
         _            <- unsubscribe.join
         _            <- poll.join
-        empty        <- ZIO.effectTotal(hub.isEmpty())
-        full         <- ZIO.effectTotal(hub.isFull())
-        size         <- ZIO.effectTotal(hub.size())
-        subscription <- ZIO.effectTotal(hub.subscribe())
+        empty        <- ZIO.succeed(hub.isEmpty())
+        full         <- ZIO.succeed(hub.isFull())
+        size         <- ZIO.succeed(hub.size())
+        subscription <- ZIO.succeed(hub.subscribe())
         _            <- offerAll(hub, List(2, 3, 4, 5, 6)).fork
         values       <- takeN(subscription, 5)
       } yield assert(empty)(isTrue) &&
@@ -618,7 +617,7 @@ object HubSpec extends ZIOBaseSpec {
         assert(values)(equalTo(List(2, 3, 4, 5, 6)))
     }
 
-  lazy val basicOperationsPow2: ZSpec[TestEnvironment, Nothing] =
+  lazy val basicOperationsPow2: Spec[TestEnvironment, Nothing] =
     suite("basic operations")(
       test("publish and poll a single value") {
         val hub          = Hub.bounded[Int](2)
@@ -667,7 +666,7 @@ object HubSpec extends ZIOBaseSpec {
       }
     )
 
-  lazy val basicOperationsUnbounded: ZSpec[TestEnvironment, Nothing] =
+  lazy val basicOperationsUnbounded: Spec[TestEnvironment, Nothing] =
     suite("basic operations")(
       test("publish and poll a single value") {
         val hub           = Hub.unbounded[Int]
@@ -776,7 +775,7 @@ object HubSpec extends ZIOBaseSpec {
       }
     )
 
-  lazy val basicOperationsSingle: ZSpec[TestEnvironment, Nothing] =
+  lazy val basicOperationsSingle: Spec[TestEnvironment, Nothing] =
     suite("basic operations")(
       test("publish and poll a single value") {
         val hub          = Hub.bounded[Int](1)

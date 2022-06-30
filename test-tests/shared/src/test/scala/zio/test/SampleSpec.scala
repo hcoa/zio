@@ -6,26 +6,26 @@ import zio.{UIO, ZIO}
 
 object SampleSpec extends ZIOBaseSpec {
 
-  def spec: ZSpec[Environment, Failure] = suite("SampleSpec")(
-    testM("monad left identity") {
+  def spec = suite("SampleSpec")(
+    test("monad left identity") {
       val sample = Sample.shrinkIntegral(0)(5)
       val result = equalSamples(sample.flatMap(Sample.noShrink), sample)
-      assertM(result)(isTrue)
+      assertZIO(result)(isTrue)
     },
-    testM("monad right identity") {
+    test("monad right identity") {
       val n                           = 5
       def f(n: Int): Sample[Any, Int] = Sample.shrinkIntegral(0)(n)
       val result                      = equalSamples(Sample.noShrink(n).flatMap(f), f(n))
-      assertM(result)(isTrue)
+      assertZIO(result)(isTrue)
     },
-    testM("monad associativity") {
+    test("monad associativity") {
       val sample                      = Sample.shrinkIntegral(0)(2)
       def f(n: Int): Sample[Any, Int] = Sample.shrinkIntegral(0)(n + 3)
       def g(n: Int): Sample[Any, Int] = Sample.shrinkIntegral(0)(n + 5)
       val result                      = equalSamples(sample.flatMap(f).flatMap(g), sample.flatMap(a => f(a).flatMap(g)))
-      assertM(result)(isTrue)
+      assertZIO(result)(isTrue)
     },
-    testM("traverse fusion") {
+    test("traverse fusion") {
       val sample              = Sample.shrinkIntegral(0)(5)
       def f(n: Int): UIO[Int] = ZIO.succeed(n + 2)
       def g(n: Int): UIO[Int] = ZIO.succeed(n * 3)
@@ -33,7 +33,7 @@ object SampleSpec extends ZIOBaseSpec {
         sample.foreach(a => f(a).flatMap(g)),
         sample.foreach(f).flatMap(_.foreach(g))
       )
-      assertM(result)(isTrue)
+      assertZIO(result)(isTrue)
     }
   )
 
@@ -44,11 +44,18 @@ object SampleSpec extends ZIOBaseSpec {
     left.flatMap(a => right.flatMap(b => equalSamples(a, b)))
 
   def equalSamples[A, B](left: Sample[Any, A], right: Sample[Any, B]): UIO[Boolean] =
-    if (left.value != right.value) UIO.succeed(false) else equalShrinks(left.shrink, right.shrink)
+    if (left.value != right.value) ZIO.succeed(false) else equalShrinks(left.shrink, right.shrink)
 
   def equalShrinks[A, B](
-    left: ZStream[Any, Nothing, Sample[Any, A]],
-    right: ZStream[Any, Nothing, Sample[Any, B]]
+    left: ZStream[Any, Nothing, Option[Sample[Any, A]]],
+    right: ZStream[Any, Nothing, Option[Sample[Any, B]]]
   ): UIO[Boolean] =
-    left.zip(right).mapM { case (a, b) => equalSamples(a, b) }.fold(true)(_ && _)
+    left
+      .zip(right)
+      .mapZIO {
+        case (Some(a), Some(b)) => equalSamples(a, b)
+        case (None, None)       => ZIO.succeedNow(true)
+        case _                  => ZIO.succeedNow(false)
+      }
+      .runFold(true)(_ && _)
 }

@@ -1,35 +1,34 @@
 package zio.stm
 
-import org.openjdk.jmh.annotations._
+import org.openjdk.jmh.annotations.{Scope => JScope, _}
 import zio._
-import zio.clock.Clock
 
 import java.util.concurrent.TimeUnit
 
-@State(Scope.Thread)
+@State(JScope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Measurement(iterations = 15, timeUnit = TimeUnit.SECONDS, time = 10)
 @Warmup(iterations = 15, timeUnit = TimeUnit.SECONDS, time = 10)
 @Fork(1)
 class TMapContentionBenchmarks {
-  import IOBenchmarks.unsafeRun
+  import BenchmarkUtil.unsafeRun
 
   @Param(Array("100", "1000", "10000"))
   var repeatedUpdates: Int = _
 
-  private var mapUpdates: URIO[Clock, Unit] = _
-  private var refUpdates: URIO[Clock, Unit] = _
+  private var mapUpdates: UIO[Unit] = _
+  private var refUpdates: UIO[Unit] = _
 
   @Setup(Level.Trial)
   def setup(): Unit = {
     val keysToUpdate = (1 to 100).toList
     val data         = (1 to 1000).toList.zipWithIndex
     val map          = unsafeRun(TMap.fromIterable(data).commit)
-    val ref          = ZTRef.unsafeMake(data.toMap)
+    val ref          = TRef.unsafeMake(data.toMap)
 
-    mapUpdates = ZIO.foreachPar_(keysToUpdate)(i => map.put(i, i).commit.repeatN(repeatedUpdates))
-    refUpdates = ZIO.foreachPar_(keysToUpdate)(i => ref.update(_.updated(i, i)).commit.repeatN(repeatedUpdates))
+    mapUpdates = ZIO.foreachParDiscard(keysToUpdate)(i => map.put(i, i).commit.repeatN(repeatedUpdates))
+    refUpdates = ZIO.foreachParDiscard(keysToUpdate)(i => ref.update(_.updated(i, i)).commit.repeatN(repeatedUpdates))
   }
 
   @Benchmark

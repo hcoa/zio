@@ -9,17 +9,17 @@ import org.openjdk.jmh.annotations.{
   Mode,
   OutputTimeUnit,
   Param,
-  Scope,
+  Scope => JScope,
   Setup,
   State,
   Warmup
 }
 
+import java.lang.{System => JSystem}
 import java.util.concurrent.TimeUnit
 import scala.collection.Iterable
-import scala.util.Random
 
-@State(Scope.Thread)
+@State(JScope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
 @Fork(1)
@@ -42,14 +42,11 @@ class ParallelMergeSortBenchmark {
   def setup(): Unit =
     sortInput = 1
       .to(samples)
-      .map(_ => Random.shuffle(1.to(size).toVector))
+      .map(_ => scala.util.Random.shuffle(1.to(size).toVector))
       .toList
 
   @Benchmark
-  def zioSort(): Unit = benchMergeSort(IOBenchmarks)
-
-  @Benchmark
-  def zioSortTraced(): Unit = benchMergeSort(IOBenchmarks.TracedRuntime)
+  def zioSort(): Unit = benchMergeSort(BenchmarkUtil)
 
   @Benchmark
   def scalaCollectionSort(): Unit = {
@@ -57,12 +54,15 @@ class ParallelMergeSortBenchmark {
     sortInput.zip(sortOutput).foreach(verifySorted)
   }
 
-  private def benchMergeSort(runtime: Runtime[Any]): Unit = runtime.unsafeRun {
-    for {
-      sortOutput <- ZIO.foreach(sortInput)(mergeSort)
-      _          <- ZIO.foreach(sortInput.zip(sortOutput))(verifySorted)
-    } yield ()
-  }
+  private def benchMergeSort(runtime: Runtime[Any]): Unit =
+    Unsafe.unsafe { implicit unsafe =>
+      runtime.unsafe.run {
+        for {
+          sortOutput <- ZIO.foreach(sortInput)(mergeSort)
+          _          <- ZIO.foreach(sortInput.zip(sortOutput))(verifySorted)
+        } yield ()
+      }.getOrThrowFiberFailure()
+    }
 
   private def verifySorted(inOut: (Iterable[Int], Iterable[Int])): IO[AssertionError, Unit] = {
     val sorted = inOut._2.toArray.sliding(2).forall {
@@ -70,22 +70,22 @@ class ParallelMergeSortBenchmark {
       case _             => true
     }
 
-    IOBenchmarks.verify(sorted)(s"Not sorted: ${inOut._2} <-- ${inOut._1}")
+    BenchmarkUtil.verify(sorted)(s"Not sorted: ${inOut._2} <-- ${inOut._1}")
   }
 
   private def mergeSort(is: Iterable[Int]): UIO[Iterable[Int]] =
     for {
-      array <- UIO(is.toArray)
-      buf   <- UIO(new Array[Int](array.length / 2))
+      array <- ZIO.succeed(is.toArray)
+      buf   <- ZIO.succeed(new Array[Int](array.length / 2))
       _     <- mergeSortInPlace(array, buf, 0, array.length)
     } yield array
 
   private def mergeSortInPlace(is: Array[Int], buf: Array[Int], start: Int, end: Int): UIO[Unit] = {
     val len = end - start
-    if (len < 2) IO.unit
+    if (len < 2) ZIO.unit
     else if (len == 2) {
-      if (is(start) <= is(start + 1)) IO.unit
-      else UIO(swap(is, start, start + 1))
+      if (is(start) <= is(start + 1)) ZIO.unit
+      else ZIO.succeed(swap(is, start, start + 1))
     } else {
       val middle    = start + len / 2
       val leftSort  = mergeSortInPlace(is, buf, start, middle)
@@ -99,30 +99,31 @@ class ParallelMergeSortBenchmark {
     }
   }
 
-  private def mergeInPlace(is: Array[Int], buf: Array[Int], start: Int, middle: Int, end: Int): UIO[Unit] = UIO {
-    var i  = start / 2
-    val ie = i + middle - start
-    var j  = middle
-    var k  = start
-    System.arraycopy(is, start, buf, i, middle - start)
+  private def mergeInPlace(is: Array[Int], buf: Array[Int], start: Int, middle: Int, end: Int): UIO[Unit] =
+    ZIO.succeed {
+      var i  = start / 2
+      val ie = i + middle - start
+      var j  = middle
+      var k  = start
+      JSystem.arraycopy(is, start, buf, i, middle - start)
 
-    while (i < ie && j < end) {
-      val (a, b) = (buf(i), is(j))
-      if (a < b) {
-        is(k) = a
-        i += 1
-      } else {
-        is(k) = b
-        j += 1
+      while (i < ie && j < end) {
+        val (a, b) = (buf(i), is(j))
+        if (a < b) {
+          is(k) = a
+          i += 1
+        } else {
+          is(k) = b
+          j += 1
+        }
+
+        k += 1
       }
 
-      k += 1
+      if (i < ie) {
+        JSystem.arraycopy(buf, i, is, k, ie - i)
+      }
     }
-
-    if (i < ie) {
-      System.arraycopy(buf, i, is, k, ie - i)
-    }
-  }
 
   private def swap(is: Array[Int], i: Int, j: Int): Unit = {
     val tmp = is(i)

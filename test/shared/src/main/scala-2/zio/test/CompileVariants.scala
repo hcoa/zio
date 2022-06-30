@@ -16,7 +16,9 @@
 
 package zio.test
 
-import zio.{UIO, ZIO}
+import zio.internal.stacktracer.SourceLocation
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+import zio.{Trace, UIO, ZIO}
 
 trait CompileVariants {
 
@@ -29,38 +31,26 @@ trait CompileVariants {
   final def typeCheck(code: String): UIO[Either[String, Unit]] =
     macro Macros.typeCheck_impl
 
-  private[test] def assertImpl[A](
-    value: => A,
-    expression: Option[String] = None,
-    sourceLocation: Option[String] = None
-  )(assertion: Assertion[A]): TestResult
-
   /**
-   * Checks the assertion holds for the given effectfully-computed value.
+   * Checks the assertion holds for the given value.
    */
-  private[test] def assertMImpl[R, E, A](effect: ZIO[R, E, A], sourceLocation: Option[String] = None)(
-    assertion: AssertionM[A]
-  ): ZIO[R, E, TestResult]
+  def assertTrue(expr: Boolean, exprs: Boolean*): TestResult = macro SmartAssertMacros.assert_impl
+  def assertTrue(expr: Boolean): TestResult = macro SmartAssertMacros.assertOne_impl
 
   /**
    * Checks the assertion holds for the given value.
    */
-  def assertTrue(expr: Boolean, exprs: Boolean*): Assert = macro SmartAssertMacros.assert_impl
-  def assertTrue(expr: Boolean): Assert = macro SmartAssertMacros.assertOne_impl
-
-  /**
-   * Checks the assertion holds for the given value.
-   */
-  def assert[A](expr: => A)(assertion: Assertion[A]): TestResult = macro Macros.assert_impl
-//  def assert(expr: Boolean): TestResult = assert[Boolean](expr)(Assertion.isTrue)
+  def assert[A](expr: => A)(assertion: Assertion[A]): TestResult =
+    macro Macros.new_assert_impl
 
   /**
    * Checks the assertion holds for the given effectfully-computed value.
    */
-  def assertM[R, E, A](effect: ZIO[R, E, A])(assertion: AssertionM[A]): ZIO[R, E, TestResult] =
-    macro Macros.assertM_impl
-
-  private[zio] def sourcePath: String = macro Macros.sourcePath_impl
+  def assertZIO[R, E, A](effect: ZIO[R, E, A])(assertion: Assertion[A])(implicit
+    trace: Trace,
+    sourceLocation: SourceLocation
+  ): ZIO[R, E, TestResult] =
+    Assertion.smartAssertZIO(effect)(assertion)
 
   private[zio] def showExpression[A](expr: => A): String = macro Macros.showExpression_impl
 }
@@ -70,13 +60,13 @@ trait CompileVariants {
  */
 object CompileVariants {
 
-  def assertProxy[A](value: => A, expression: String, sourceLocation: String)(
+  def newAssertProxy[A](value: => A, codeString: String, assertionString: String)(
     assertion: Assertion[A]
-  ): TestResult =
-    zio.test.assertImpl(value, Some(expression), Some(sourceLocation))(assertion)
+  )(implicit trace: Trace, sourceLocation: SourceLocation): TestResult =
+    zio.test.assertImpl(value, Some(codeString), Some(assertionString))(assertion)
 
-  def assertMProxy[R, E, A](effect: ZIO[R, E, A], sourceLocation: String)(
-    assertion: AssertionM[A]
-  ): ZIO[R, E, TestResult] =
-    zio.test.assertMImpl(effect, Some(sourceLocation))(assertion)
+  def assertZIOProxy[R, E, A](effect: ZIO[R, E, A])(
+    assertion: Assertion[A]
+  )(implicit trace: Trace, sourceLocation: SourceLocation): ZIO[R, E, TestResult] =
+    zio.test.assertZIOImpl(effect)(assertion)
 }

@@ -3,15 +3,13 @@ package zio.concurrent
 import zio.test.Assertion._
 import zio.test._
 import zio._
-import zio.duration._
-import zio.test.environment.TestClock
 
-object CyclicBarrierSpec extends DefaultRunnableSpec {
+object CyclicBarrierSpec extends ZIOSpecDefault {
   private val parties = 100
 
-  val spec: ZSpec[Environment, Failure] =
+  val spec =
     suite("CyclicBarrierSpec")(
-      testM("Construction") {
+      test("Construction") {
         for {
           barrier  <- CyclicBarrier.make(parties)
           isBroken <- barrier.isBroken
@@ -20,7 +18,7 @@ object CyclicBarrierSpec extends DefaultRunnableSpec {
           assert(isBroken)(equalTo(false)) &&
           assert(waiting)(equalTo(0))
       },
-      testM("Releases the barrier") {
+      test("Releases the barrier") {
         for {
           barrier <- CyclicBarrier.make(2)
           f1      <- barrier.await.fork
@@ -31,7 +29,7 @@ object CyclicBarrierSpec extends DefaultRunnableSpec {
         } yield assert(ticket1)(equalTo(1)) &&
           assert(ticket2)(equalTo(0))
       },
-      testM("Releases the barrier and performs the action") {
+      test("Releases the barrier and performs the action") {
         for {
           promise    <- Promise.make[Nothing, Unit]
           barrier    <- CyclicBarrier.make(2, promise.succeed(()))
@@ -43,7 +41,7 @@ object CyclicBarrierSpec extends DefaultRunnableSpec {
           isComplete <- promise.isDone
         } yield assert(isComplete)(isTrue)
       },
-      testM("Releases the barrier and cycles") {
+      test("Releases the barrier and cycles") {
         for {
           barrier <- CyclicBarrier.make(2)
           f1      <- barrier.await.fork
@@ -61,7 +59,7 @@ object CyclicBarrierSpec extends DefaultRunnableSpec {
           assert(ticket3)(equalTo(1)) &&
           assert(ticket4)(equalTo(0))
       },
-      testM("Breaks on reset") {
+      test("Breaks on reset") {
         for {
           barrier <- CyclicBarrier.make(parties)
           f1      <- barrier.await.fork
@@ -73,7 +71,7 @@ object CyclicBarrierSpec extends DefaultRunnableSpec {
           res2    <- f2.await
         } yield assert(res1)(fails(isUnit)) && assert(res2)(fails(isUnit))
       },
-      testM("Breaks on party interruption") {
+      test("Breaks on party interruption") {
         for {
           barrier   <- CyclicBarrier.make(parties)
           f1        <- barrier.await.timeout(1.second).fork

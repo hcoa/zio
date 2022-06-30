@@ -33,7 +33,7 @@ object BuildHelper {
     "-feature",
     "-unchecked"
   ) ++ {
-    if (sys.env.contains("CI")) {
+    if (true) {
       Seq("-Xfatal-warnings")
     } else {
       Nil
@@ -45,7 +45,7 @@ object BuildHelper {
     "-language:existentials",
     "-explaintypes",
     "-Yrangepos",
-    "-Xlint:_,-missing-interpolator,-type-parameter-shadow",
+    "-Xlint:_,-missing-interpolator,-type-parameter-shadow,-infer-any",
     "-Ywarn-numeric-widen",
     "-Ywarn-value-discard"
   )
@@ -64,56 +64,27 @@ object BuildHelper {
       buildInfoPackage := packageName
     )
 
-  val dottySettings = Seq(
-    crossScalaVersions += Scala3,
-    scalacOptions ++= {
-      if (scalaVersion.value == Scala3)
-        Seq("-noindent")
-      else
-        Seq()
-    },
-    scalacOptions --= {
-      if (scalaVersion.value == Scala3)
-        Seq("-Xfatal-warnings")
-      else
-        Seq()
-    },
-    Compile / doc / sources := {
-      val old = (Compile / doc / sources).value
-      if (scalaVersion.value == Scala3) {
-        Nil
-      } else {
-        old
-      }
-    },
-    Test / parallelExecution := {
-      val old = (Test / parallelExecution).value
-      if (scalaVersion.value == Scala3) {
-        false
-      } else {
-        old
-      }
-    }
-  )
-
   // Keep this consistent with the version in .core-tests/shared/src/test/scala/REPLSpec.scala
   val replSettings = makeReplSettings {
     """|import zio._
-       |import zio.console._
-       |import zio.duration._
-       |import zio.Runtime.default._
-       |implicit class RunSyntax[A](io: ZIO[ZEnv, Any, A]){ def unsafeRun: A = Runtime.default.unsafeRun(io.provideLayer(ZEnv.live)) }
+       |implicit class RunSyntax[A](io: ZIO[Any, Any, A]) {
+       |  def unsafeRun: A =
+       |    Unsafe.unsafe { implicit unsafe =>
+       |      Runtime.default.unsafe.run(io).getOrThrowFiberFailure()
+       |    }
+       |}
     """.stripMargin
   }
 
   // Keep this consistent with the version in .streams-tests/shared/src/test/scala/StreamREPLSpec.scala
   val streamReplSettings = makeReplSettings {
     """|import zio._
-       |import zio.console._
-       |import zio.duration._
-       |import zio.stream._
-       |import zio.Runtime.default._
-       |implicit class RunSyntax[A](io: ZIO[ZEnv, Any, A]){ def unsafeRun: A = Runtime.default.unsafeRun(io.provideLayer(ZEnv.live)) }
+       |implicit class RunSyntax[A](io: ZIO[Any, Any, A]) {
+       |  def unsafeRun: A =
+       |    Unsafe.unsafe { implicit unsafe =>
+       |      Runtime.default.unsafe.run(io).getOrThrowFiberFailure()
+       |    }
+       |}
     """.stripMargin
   }
 
@@ -125,10 +96,8 @@ object BuildHelper {
     // avoid deadlocking on parallel operations, see
     //   https://issues.scala-lang.org/browse/SI-9076
     Compile / console / scalacOptions := Seq(
-      "-Ypartial-unification",
       "-language:higherKinds",
       "-language:existentials",
-      "-Yno-adapted-args",
       "-Xsource:2.13",
       "-Yrepl-class-based"
     ),
@@ -137,10 +106,11 @@ object BuildHelper {
 
   def extraOptions(scalaVersion: String, optimize: Boolean) =
     CrossVersion.partialVersion(scalaVersion) match {
-      case Some((3, 0)) =>
+      case Some((3, _)) =>
         Seq(
           "-language:implicitConversions",
-          "-Xignore-scala2-macros"
+          "-Xignore-scala2-macros",
+          "-noindent"
         )
       case Some((2, 13)) =>
         Seq(
@@ -155,7 +125,6 @@ object BuildHelper {
           "-Ypartial-unification",
           "-Yno-adapted-args",
           "-Ywarn-inaccessible",
-          "-Ywarn-infer-any",
           "-Ywarn-nullary-override",
           "-Ywarn-nullary-unit",
           "-Ywarn-unused:params,-implicits",
@@ -169,7 +138,6 @@ object BuildHelper {
           "-Ypartial-unification",
           "-Yno-adapted-args",
           "-Ywarn-inaccessible",
-          "-Ywarn-infer-any",
           "-Ywarn-nullary-override",
           "-Ywarn-nullary-unit",
           "-Xexperimental",
@@ -229,6 +197,12 @@ object BuildHelper {
     crossScalaVersions       := Seq(Scala211, Scala212, Scala213, Scala3),
     ThisBuild / scalaVersion := Scala213,
     scalacOptions ++= stdOptions ++ extraOptions(scalaVersion.value, optimize = !isSnapshot.value),
+    scalacOptions --= {
+      if (scalaVersion.value == Scala3)
+        List("-Xfatal-warnings")
+      else
+        List()
+    },
     libraryDependencies ++= {
       if (scalaVersion.value == Scala3)
         Seq(
@@ -240,12 +214,18 @@ object BuildHelper {
           compilerPlugin("com.github.ghik" % "silencer-plugin" % SilencerVersion cross CrossVersion.full)
         )
     },
-    Test / parallelExecution := true,
+    Test / parallelExecution := { scalaVersion.value != Scala3 },
     incOptions ~= (_.withLogRecompileOnMacro(false)),
-    autoAPIMappings := true,
+    // autoAPIMappings := true,
     unusedCompileDependenciesFilter -= moduleFilter("org.scala-js", "scalajs-library"),
     Compile / fork := true,
-    Test / fork    := false
+    Test / fork    := false,
+    // For compatibility with Java 9+ module system;
+    // without Automatic-Module-Name, the module name is derived from the jar file which is invalid because of the scalaVersion suffix.
+    Compile / packageBin / packageOptions +=
+      Package.ManifestAttributes(
+        "Automatic-Module-Name" -> s"${organization.value}.$prjName".replaceAll("-", ".")
+      )
   )
 
   def macroExpansionSettings = Seq(
@@ -305,7 +285,6 @@ object BuildHelper {
         |${item("testJS")} - Runs all ScalaJS tests
         |${item("testOnly *.YourSpec -- -t \"YourLabel\"")} - Only runs tests with matching term e.g.
         |${subItem("coreTestsJVM/testOnly *.ZIOSpec -- -t \"happy-path\"")}
-        |${item("docs/docusaurusCreateSite")} - Generates the ZIO microsite
       """.stripMargin
   }
 

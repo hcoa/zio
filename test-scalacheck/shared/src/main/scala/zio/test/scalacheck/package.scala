@@ -3,7 +3,6 @@ package zio.test
 import org.scalacheck.rng.Seed
 import org.scalacheck.Gen.Parameters
 import zio._
-import zio.random.Random
 
 /**
  * Provides functionality for converting legacy ScalaCheck generators to ZIO
@@ -18,7 +17,7 @@ import zio.random.Random
  * import zio.test._
  * import zio.test.scalacheck._
  *
- * val anyInt: Gen[Random with Sized, Int] =
+ * val anyInt: Gen[Sized, Int] =
  *   Arbitrary.arbitrary[Int].toGenZIO
  * }}}
  */
@@ -29,10 +28,10 @@ package object scalacheck {
     /**
      * Converts a legacy ScalaCheck `Gen` to a ZIO Test `Gen`.
      */
-    def toGenZIO: Gen[Random with Sized, A] =
-      Gen.fromEffect {
+    def toGenZIO: Gen[Sized, A] =
+      Gen.fromZIO {
         for {
-          long <- random.nextLong
+          long <- Random.nextLong
           size <- Sized.size
           a    <- ZIO.succeed(self.pureApply(Parameters.default.withSize(size), Seed(long)))
         } yield a

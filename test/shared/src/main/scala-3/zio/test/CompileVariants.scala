@@ -16,8 +16,9 @@
 
 package zio.test
 
-import zio.test.Macros.location
-import zio.{UIO, ZIO}
+import zio.internal.stacktracer.{SourceLocation, Tracer}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+import zio.{UIO, ZIO, Trace}
 
 import scala.annotation.tailrec
 import scala.compiletime.testing.typeChecks
@@ -32,39 +33,23 @@ trait CompileVariants {
    */
   inline def typeCheck(inline code: String): UIO[Either[String, Unit]] =
     try {
-      if (typeChecks(code)) UIO.succeedNow(Right(()))
-      else UIO.succeedNow(Left(errorMessage))
+      if (typeChecks(code)) ZIO.succeedNow(Right(()))
+      else ZIO.succeedNow(Left(errorMessage))
     } catch {
-      case _: Throwable => UIO.die(new RuntimeException("Compilation failed"))
+      case _: Throwable => ZIO.die(new RuntimeException("Compilation failed"))
     }
 
   private val errorMessage =
-    "Reporting of compilation error messages on Dotty is not currently supported due to instability of the underlying APIs."
+    "Reporting of compilation error messages on Scala 3 is not currently supported due to instability of the underlying APIs."
 
-  /**
-   * Checks the assertion holds for the given value.
-   */
-  private[test] def assertImpl[A](
-    value: => A,
-    expression: Option[String] = None,
-    sourceLocation: Option[String] = None
-  )(
-    assertion: Assertion[A]
-  ): TestResult
+  inline def assertTrue(inline exprs: => Boolean*)(implicit sourceLocation: SourceLocation): TestResult =
+    ${SmartAssertMacros.smartAssert('exprs, 'sourceLocation)}
 
-  /**
-   * Checks the assertion holds for the given effectfully-computed value.
-   */
-  private[test] def assertMImpl[R, E, A](effect: ZIO[R, E, A], sourceLocation: Option[String] = None)
-                                            (assertion: AssertionM[A]): ZIO[R, E, TestResult]
+  inline def assert[A](inline value: => A)(inline assertion: Assertion[A])(implicit trace: Trace, sourceLocation: SourceLocation): TestResult =
+    ${Macros.assert_impl('value)('assertion, 'trace, 'sourceLocation)}
 
-  inline def assertTrue(inline exprs: => Boolean*): Assert = ${SmartAssertMacros.smartAssert('exprs)}
-
-  inline def assert[A](inline value: => A)(inline assertion: Assertion[A]): TestResult = ${Macros.assert_impl('value)('assertion)}
-
-  inline def assertM[R, E, A](effect: ZIO[R, E, A])(assertion: AssertionM[A]): ZIO[R, E, TestResult] = ${Macros.assertM_impl('effect)('assertion)}
-
-  private[zio] inline def sourcePath: String = ${Macros.sourcePath_impl}
+  inline def assertZIO[R, E, A](effect: ZIO[R, E, A])(assertion: Assertion[A]): ZIO[R, E, TestResult] =
+     ${Macros.assertZIO_impl('effect)('assertion)}
 
   private[zio] inline def showExpression[A](inline value: => A): String = ${Macros.showExpression_impl('value)}
 }
@@ -74,15 +59,13 @@ trait CompileVariants {
  */
 object CompileVariants {
 
-  def assertProxy[A](value: => A, expression: String, sourceLocation: String)(assertion: Assertion[A]): TestResult =
-    zio.test.assertImpl(value, Some(expression), Some(sourceLocation))(assertion)
-
-  def smartAssertProxy[A](value: => A, expression: String, sourceLocation: String)(
+  def assertProxy[A](value: => A, expression: String, assertionCode: String)(
     assertion: Assertion[A]
-  ): TestResult =
-    zio.test.assertImpl(value, Some(expression), Some(sourceLocation))(assertion)
+  )(implicit trace: Trace, sourceLocation: SourceLocation): TestResult =
+    zio.test.assertImpl(value, Some(expression), Some(assertionCode))(assertion)
 
-  def assertMProxy[R, E, A](effect: ZIO[R, E, A], sourceLocation: String)
-                              (assertion: AssertionM[A]): ZIO[R, E, TestResult] =
-    zio.test.assertMImpl(effect, Some(sourceLocation))(assertion)
+  def assertZIOProxy[R, E, A](effect: ZIO[R, E, A], expression: String, assertionCode: String)(
+    assertion: Assertion[A],
+  )(implicit trace: Trace, sourceLocation: SourceLocation): ZIO[R, E, TestResult] =
+    zio.test.assertZIOImpl(effect, Some(expression), Some(assertionCode))(assertion)
 }

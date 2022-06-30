@@ -16,8 +16,8 @@
 
 package zio.test
 
-import zio.internal.Executor
-import zio.{Runtime, URIO, ZIO}
+import zio.{Executor, Runtime, RuntimeFlag, RuntimeFlags, Trace, URIO, Unsafe, ZIO}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import scala.concurrent.ExecutionContext
 
@@ -47,7 +47,7 @@ private[test] object Fun {
    * Constructs a new `Fun` from an effectual function. The function should not
    * involve asynchronous effects.
    */
-  def make[R, A, B](f: A => URIO[R, B]): ZIO[R, Nothing, Fun[A, B]] =
+  def make[R, A, B](f: A => URIO[R, B])(implicit trace: Trace): ZIO[R, Nothing, Fun[A, B]] =
     makeHash(f)(_.hashCode)
 
   /**
@@ -55,10 +55,20 @@ private[test] object Fun {
    * This is useful when the domain of the function does not implement
    * `hashCode` in a way that is consistent with equality.
    */
-  def makeHash[R, A, B](f: A => URIO[R, B])(hash: A => Int): ZIO[R, Nothing, Fun[A, B]] =
-    ZIO.runtime[R].map { runtime =>
-      val funRuntime = withFunExecutor(runtime)
-      Fun(a => funRuntime.unsafeRun(f(a)), hash)
+  def makeHash[R, A, B](f: A => URIO[R, B])(hash: A => Int)(implicit trace: Trace): ZIO[R, Nothing, Fun[A, B]] =
+    ZIO.executor.flatMap { executor =>
+      ZIO.acquireReleaseWith {
+        ZIO.shift(funExecutor)
+      } { _ =>
+        ZIO.shift(executor) *> ZIO.unshift
+      } { _ =>
+        funRuntime[R].map { runtime =>
+          Fun(
+            a => runtime.unsafe.run(f(a))(trace, Unsafe.unsafe).getOrThrowFiberFailure()(Unsafe.unsafe),
+            hash
+          )
+        }
+      }
     }
 
   /**
@@ -70,15 +80,22 @@ private[test] object Fun {
   /**
    * Constructs a new runtime that synchronously executes effects.
    */
-  private def withFunExecutor[R](runtime: Runtime[R]): Runtime[R] =
-    runtime.withExecutor {
-      Executor.fromExecutionContext(Int.MaxValue) {
-        new ExecutionContext {
-          def execute(runnable: Runnable): Unit =
-            runnable.run()
-          def reportFailure(cause: Throwable): Unit =
-            cause.printStackTrace()
-        }
+  private val funExecutor: Executor =
+    Executor.fromExecutionContext {
+      new ExecutionContext {
+        def execute(runnable: Runnable): Unit =
+          runnable.run()
+        def reportFailure(cause: Throwable): Unit =
+          cause.printStackTrace()
       }
+    }
+
+  private def funRuntime[R](implicit trace: Trace): ZIO[R, Nothing, Runtime[R]] =
+    ZIO.runtime[R].map { runtime =>
+      Runtime(
+        runtime.environment,
+        runtime.fiberRefs,
+        RuntimeFlags.disable(runtime.runtimeFlags)(RuntimeFlag.CooperativeYielding)
+      )
     }
 }

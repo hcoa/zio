@@ -1,11 +1,12 @@
 package zio
 
-import org.openjdk.jmh.annotations._
+import cats.effect.unsafe.implicits.global
+import org.openjdk.jmh.annotations.{Scope => JScope, _}
 
 import java.util.concurrent.TimeUnit
 import scala.collection.immutable.Range
 
-@State(Scope.Thread)
+@State(JScope.Thread)
 @BenchmarkMode(Array(Mode.Throughput))
 @OutputTimeUnit(TimeUnit.SECONDS)
 class ArrayFillBenchmark {
@@ -16,15 +17,15 @@ class ArrayFillBenchmark {
 
   @Benchmark
   def zioArrayFill(): Unit = {
-    import IOBenchmarks.unsafeRun
+    import BenchmarkUtil.unsafeRun
 
     def arrayFill(array: Array[Int])(i: Int): UIO[Unit] =
-      if (i >= array.length) UIO.unit
-      else UIO(array.update(i, i)).flatMap(_ => arrayFill(array)(i + 1))
+      if (i >= array.length) ZIO.unit
+      else ZIO.succeed(array.update(i, i)).flatMap(_ => arrayFill(array)(i + 1))
 
     unsafeRun(
       for {
-        array <- IO.effectTotal[Array[Int]](createTestArray)
+        array <- ZIO.succeed[Array[Int]](createTestArray)
         _     <- arrayFill(array)(0)
       } yield ()
     )
@@ -60,20 +61,5 @@ class ArrayFillBenchmark {
       array <- IO(createTestArray)
       _     <- arrayFill(array)(0)
     } yield ()).unsafeRunSync()
-  }
-
-  @Benchmark
-  def monixArrayFill(): Unit = {
-    import IOBenchmarks.monixScheduler
-    import monix.eval.Task
-
-    def arrayFill(array: Array[Int])(i: Int): Task[Unit] =
-      if (i >= array.length) Task.unit
-      else Task.eval(array.update(i, i)).flatMap(_ => arrayFill(array)(i + 1))
-
-    (for {
-      array <- Task.eval(createTestArray)
-      _     <- arrayFill(array)(0)
-    } yield ()).runSyncUnsafe(scala.concurrent.duration.Duration.Inf)
   }
 }

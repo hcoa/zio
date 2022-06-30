@@ -17,6 +17,7 @@
 package zio.internal
 
 import zio.{Chunk, ChunkBuilder}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.util.concurrent.atomic._
 
@@ -91,7 +92,7 @@ private final class BoundedHubArb[A](requestedCapacity: Int) extends Hub[A] {
     published
   }
 
-  def publishAll(as: Iterable[A]): Chunk[A] = {
+  def publishAll[A1 <: A](as: Iterable[A1]): Chunk[A1] = {
     var currentState = state.get
     val iterator     = as.iterator
     var loop         = true

@@ -17,7 +17,7 @@
 package zio.stm
 
 import zio.Chunk
-import zio.stm.ZSTM.internal._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * Wraps array of [[TRef]] and adds methods for convenience.
@@ -44,7 +44,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Finds the result of applying an transactional partial function to the first
    * value in its domain.
    */
-  def collectFirstM[E, B](pf: PartialFunction[A, STM[E, B]]): STM[E, Option[B]] =
+  def collectFirstSTM[E, B](pf: PartialFunction[A, STM[E, B]]): STM[E, Option[B]] =
     find(pf.isDefinedAt).flatMap {
       case Some(a) => pf(a).map(Some(_))
       case _       => STM.none
@@ -64,8 +64,8 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
   /**
    * Count the values in the array matching a transactional predicate.
    */
-  def countM[E](p: A => STM[E, Boolean]): STM[E, Int] =
-    foldM(0)((n, a) => p(a).map(result => if (result) n + 1 else n))
+  def countSTM[E](p: A => STM[E, Boolean]): STM[E, Int] =
+    foldSTM(0)((n, a) => p(a).map(result => if (result) n + 1 else n))
 
   /**
    * Determine if the array contains a value satisfying a predicate.
@@ -76,14 +76,14 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Determine if the array contains a value satisfying a transactional
    * predicate.
    */
-  def existsM[E](p: A => STM[E, Boolean]): STM[E, Boolean] =
-    countM(p).map(_ > 0)
+  def existsSTM[E](p: A => STM[E, Boolean]): STM[E, Boolean] =
+    countSTM(p).map(_ > 0)
 
   /**
    * Find the first element in the array matching a predicate.
    */
   def find(p: A => Boolean): USTM[Option[A]] =
-    new ZSTM((journal, _, _, _) => {
+    ZSTM.Effect { (journal, _, _) =>
       var i   = 0
       var res = Option.empty[A]
 
@@ -96,14 +96,14 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
         i += 1
       }
 
-      TExit.Succeed(res)
-    })
+      res
+    }
 
   /**
    * Find the last element in the array matching a predicate.
    */
   def findLast(p: A => Boolean): USTM[Option[A]] =
-    new ZSTM((journal, _, _, _) => {
+    ZSTM.Effect { (journal, _, _) =>
       var i   = array.length - 1
       var res = Option.empty[A]
 
@@ -116,13 +116,13 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
         i -= 1
       }
 
-      TExit.Succeed(res)
-    })
+      res
+    }
 
   /**
    * Find the last element in the array matching a transactional predicate.
    */
-  def findLastM[E](p: A => STM[E, Boolean]): STM[E, Option[A]] = {
+  def findLastSTM[E](p: A => STM[E, Boolean]): STM[E, Option[A]] = {
     val init = (Option.empty[A], array.length - 1)
     val cont = (s: (Option[A], Int)) => s._1.isEmpty && s._2 >= 0
 
@@ -137,7 +137,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
   /**
    * Find the first element in the array matching a transactional predicate.
    */
-  def findM[E](p: A => STM[E, Boolean]): STM[E, Option[A]] = {
+  def findSTM[E](p: A => STM[E, Boolean]): STM[E, Option[A]] = {
     val init = (Option.empty[A], 0)
     val cont = (s: (Option[A], Int)) => s._1.isEmpty && s._2 < array.length
 
@@ -159,7 +159,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Atomically folds using a pure function.
    */
   def fold[Z](zero: Z)(op: (Z, A) => Z): USTM[Z] =
-    new ZSTM((journal, _, _, _) => {
+    ZSTM.Effect { (journal, _, _) =>
       var res = zero
       var i   = 0
 
@@ -169,13 +169,13 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
         i += 1
       }
 
-      TExit.Succeed(res)
-    })
+      res
+    }
 
   /**
    * Atomically folds using a transactional function.
    */
-  def foldM[E, Z](zero: Z)(op: (Z, A) => STM[E, Z]): STM[E, Z] =
+  def foldSTM[E, Z](zero: Z)(op: (Z, A) => STM[E, Z]): STM[E, Z] =
     toChunk.flatMap(STM.foldLeft(_)(zero)(op))
 
   /**
@@ -188,14 +188,14 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Atomically evaluate the conjunction of a transactional predicate across the
    * members of the array.
    */
-  def forallM[E](p: A => STM[E, Boolean]): STM[E, Boolean] =
-    countM(p).map(_ == array.length)
+  def forallSTM[E](p: A => STM[E, Boolean]): STM[E, Boolean] =
+    countSTM(p).map(_ == array.length)
 
   /**
    * Atomically performs transactional effect for each item in array.
    */
   def foreach[E](f: A => STM[E, Unit]): STM[E, Unit] =
-    foldM(())((_, a) => f(a))
+    foldSTM(())((_, a) => f(a))
 
   /**
    * Get the first index of a specific value in the array or -1 if it does not
@@ -222,7 +222,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
     if (from < 0)
       STM.succeedNow(-1)
     else
-      new ZSTM((journal, _, _, _) => {
+      ZSTM.Effect { (journal, _, _) =>
         var i     = from
         var found = false
 
@@ -232,20 +232,21 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
           i += 1
         }
 
-        if (found) TExit.Succeed(i - 1) else TExit.Succeed(-1)
-      })
+        if (found) i - 1 else -1
+      }
 
   /**
    * Get the index of the first entry in the array matching a transactional
    * predicate.
    */
-  def indexWhereM[E](p: A => STM[E, Boolean]): STM[E, Int] = indexWhereM(p, 0)
+  def indexWhereSTM[E](p: A => STM[E, Boolean]): STM[E, Int] =
+    indexWhereSTM(p, 0)
 
   /**
    * Starting at specified index, get the index of the next entry that matches a
    * transactional predicate.
    */
-  def indexWhereM[E](p: A => STM[E, Boolean], from: Int): STM[E, Int] = {
+  def indexWhereSTM[E](p: A => STM[E, Boolean], from: Int): STM[E, Int] = {
     def forIndex(i: Int): STM[E, Int] =
       if (i < array.length)
         array(i).get.flatMap(p).flatMap(ok => if (ok) STM.succeedNow(i) else forIndex(i + 1))
@@ -270,7 +271,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
     if (end >= array.length)
       STM.succeedNow(-1)
     else
-      new ZSTM((journal, _, _, _) => {
+      ZSTM.Effect { (journal, _, _) =>
         var i     = end
         var found = false
 
@@ -279,8 +280,8 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
           i -= 1
         }
 
-        if (found) TExit.Succeed(i + 1) else TExit.Succeed(-1)
-      })
+        if (found) i + 1 else -1
+      }
 
   /**
    * The last entry in the array, if it exists.
@@ -304,7 +305,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Atomically reduce the array, if non-empty, by a binary operator.
    */
   def reduceOption(op: (A, A) => A): USTM[Option[A]] =
-    new ZSTM((journal, _, _, _) => {
+    ZSTM.Effect { (journal, _, _) =>
       var i   = 0
       var res = null.asInstanceOf[A]
 
@@ -319,15 +320,15 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
         i += 1
       }
 
-      TExit.Succeed(Option(res))
-    })
+      Option(res)
+    }
 
   /**
    * Atomically reduce the non-empty array using a transactional binary
    * operator.
    */
-  def reduceOptionM[E](op: (A, A) => STM[E, A]): STM[E, Option[A]] =
-    foldM(Option.empty[A]) { (acc, a) =>
+  def reduceOptionSTM[E](op: (A, A) => STM[E, A]): STM[E, Option[A]] =
+    foldSTM(Option.empty[A]) { (acc, a) =>
       acc match {
         case Some(acc) => op(acc, a).map(Some(_))
         case _         => STM.some(a)
@@ -356,7 +357,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
    * Atomically updates all elements using a pure function.
    */
   def transform(f: A => A): USTM[Unit] =
-    new ZSTM((journal, _, _, _) => {
+    ZSTM.Effect { (journal, _, _) =>
       var i = 0
 
       while (i < array.length) {
@@ -365,15 +366,15 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
         i += 1
       }
 
-      TExit.Succeed(())
-    })
+      ()
+    }
 
   /**
    * Atomically updates all elements using a transactional effect.
    */
-  def transformM[E](f: A => STM[E, A]): STM[E, Unit] =
+  def transformSTM[E](f: A => STM[E, A]): STM[E, Unit] =
     STM.foreach(Chunk.fromArray(array))(_.get.flatMap(f)).flatMap { newData =>
-      new ZSTM((journal, _, _, _) => {
+      ZSTM.Effect { (journal, _, _) =>
         var i  = 0
         val it = newData.iterator
 
@@ -382,8 +383,8 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
           i += 1
         }
 
-        TExit.Succeed(())
-      })
+        ()
+      }
     }
 
   /**
@@ -398,7 +399,7 @@ final class TArray[A] private[stm] (private[stm] val array: Array[TRef[A]]) exte
   /**
    * Atomically updates element in the array with given transactional effect.
    */
-  def updateM[E](index: Int, fn: A => STM[E, A]): STM[E, Unit] =
+  def updateSTM[E](index: Int, fn: A => STM[E, A]): STM[E, Unit] =
     if (0 <= index && index < array.length)
       for {
         currentVal <- array(index).get
@@ -423,6 +424,6 @@ object TArray {
   /**
    * Makes a new `TArray` initialized with provided iterable.
    */
-  def fromIterable[A](data: Iterable[A]): USTM[TArray[A]] =
-    STM.foreach(data)(TRef.make(_)).map(list => new TArray(list.toArray))
+  def fromIterable[A](data: => Iterable[A]): USTM[TArray[A]] =
+    STM.suspend(STM.foreach(data)(TRef.make(_)).map(list => new TArray(list.toArray)))
 }

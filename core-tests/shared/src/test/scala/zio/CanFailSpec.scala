@@ -5,28 +5,28 @@ import zio.test._
 
 object CanFailSpec extends ZIOBaseSpec {
 
-  def spec: ZSpec[Environment, Failure] = suite("CanFailSpec")(
-    testM("useful combinators compile") {
+  def spec = suite("CanFailSpec")(
+    test("useful combinators compile") {
       val result = typeCheck {
         """
             import zio._
-            val io =  IO(1 / 0)
-            val uio = UIO(0)
+            val io =  ZIO.attempt(1 / 0)
+            val uio = ZIO.succeed(0)
             io.orElse(uio)
             """
       }
-      assertM(result)(isRight(anything))
-    },
-    testM("useless combinators don't compile") {
+      assertZIO(result)(isRight(anything))
+    } @@ TestAspect.scala2Only,
+    test("useless combinators don't compile") {
       val result = typeCheck {
         """
             import zio._
-            val io =  IO(1 / 0)
-            val uio = UIO(0)
+            val io =  ZIO.attempt(1 / 0)
+            val uio = ZIO.succeed(0)
             uio.orElse(io)
             """
       }
-      assertM(result)(isLeft(anything))
+      assertZIO(result)(isLeft(anything))
     }
   )
 }

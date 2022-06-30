@@ -17,6 +17,7 @@
 package zio.stream
 
 import zio._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
  * A `Take[E, A]` represents a single `take` from a queue modeling a stream of
@@ -28,15 +29,15 @@ case class Take[+E, +A](exit: Exit[Option[E], Chunk[A]]) extends AnyVal {
   /**
    * Transforms `Take[E, A]` to `ZIO[R, E, B]`.
    */
-  def done[R]: ZIO[R, Option[E], Chunk[A]] =
-    IO.done(exit)
+  def done[R](implicit trace: Trace): ZIO[R, Option[E], Chunk[A]] =
+    ZIO.done(exit)
 
   /**
    * Folds over the failure cause, success value and end-of-stream marker to
    * yield a value.
    */
   def fold[Z](end: => Z, error: Cause[E] => Z, value: Chunk[A] => Z): Z =
-    exit.fold(Cause.sequenceCauseOption(_).fold(end)(error), value)
+    exit.foldExit(Cause.flipCauseOption(_).fold(end)(error), value)
 
   /**
    * Effectful version of [[Take#fold]].
@@ -44,41 +45,41 @@ case class Take[+E, +A](exit: Exit[Option[E], Chunk[A]]) extends AnyVal {
    * Folds over the failure cause, success value and end-of-stream marker to
    * yield an effect.
    */
-  def foldM[R, E1, Z](
+  def foldZIO[R, E1, Z](
     end: => ZIO[R, E1, Z],
     error: Cause[E] => ZIO[R, E1, Z],
     value: Chunk[A] => ZIO[R, E1, Z]
-  ): ZIO[R, E1, Z] =
-    exit.foldM(Cause.sequenceCauseOption(_).fold(end)(error), value)
+  )(implicit trace: Trace): ZIO[R, E1, Z] =
+    exit.foldExitZIO(Cause.flipCauseOption(_).fold(end)(error), value)
 
   /**
    * Checks if this `take` is done (`Take.end`).
    */
   def isDone: Boolean =
-    exit.fold(Cause.sequenceCauseOption(_).isEmpty, _ => false)
+    exit.foldExit(Cause.flipCauseOption(_).isEmpty, _ => false)
 
   /**
    * Checks if this `take` is a failure.
    */
   def isFailure: Boolean =
-    exit.fold(Cause.sequenceCauseOption(_).nonEmpty, _ => false)
+    exit.foldExit(Cause.flipCauseOption(_).nonEmpty, _ => false)
 
   /**
    * Checks if this `take` is a success.
    */
   def isSuccess: Boolean =
-    exit.fold(_ => false, _ => true)
+    exit.foldExit(_ => false, _ => true)
 
   /**
    * Transforms `Take[E, A]` to `Take[E, B]` by applying function `f`.
    */
   def map[B](f: A => B): Take[E, B] =
-    Take(exit.map(_.map(f)))
+    Take(exit.mapExit(_.map(f)))
 
   /**
    * Returns an effect that effectfully "peeks" at the success of this take.
    */
-  def tap[R, E1](f: Chunk[A] => ZIO[R, E1, Any]): ZIO[R, E1, Unit] =
+  def tap[R, E1](f: Chunk[A] => ZIO[R, E1, Any])(implicit trace: Trace): ZIO[R, E1, Unit] =
     exit.foreach(f).unit
 }
 
@@ -103,26 +104,26 @@ object Take {
     Take(Exit.fail(Some(e)))
 
   /**
+   * Creates a failing `Take[E, Nothing]` with the specified cause.
+   */
+  def failCause[E](c: Cause[E]): Take[E, Nothing] =
+    Take(Exit.failCause(c.map(Some(_))))
+
+  /**
    * Creates an effect from `ZIO[R, E,A]` that does not fail, but succeeds with
    * the `Take[E, A]`. Error from stream when pulling is converted to
-   * `Take.halt`. Creates a singleton chunk.
+   * `Take.failCause`. Creates a singleton chunk.
    */
-  def fromEffect[R, E, A](zio: ZIO[R, E, A]): URIO[R, Take[E, A]] =
-    zio.foldCause(halt, single)
+  def fromZIO[R, E, A](zio: ZIO[R, E, A])(implicit trace: Trace): URIO[R, Take[E, A]] =
+    zio.foldCause(failCause, single)
 
   /**
    * Creates effect from `Pull[R, E, A]` that does not fail, but succeeds with
    * the `Take[E, A]`. Error from stream when pulling is converted to
-   * `Take.halt`, end of stream to `Take.end`.
+   * `Take.failCause`, end of stream to `Take.end`.
    */
-  def fromPull[R, E, A](pull: ZStream.Pull[R, E, A]): URIO[R, Take[E, A]] =
-    pull.foldCause(Cause.sequenceCauseOption(_).fold[Take[E, Nothing]](end)(halt), chunk)
-
-  /**
-   * Creates a failing `Take[E, Nothing]` with the specified cause.
-   */
-  def halt[E](c: Cause[E]): Take[E, Nothing] =
-    Take(Exit.halt(c.map(Some(_))))
+  def fromPull[R, E, A](pull: ZStream.Pull[R, E, A])(implicit trace: Trace): URIO[R, Take[E, A]] =
+    pull.foldCause(Cause.flipCauseOption(_).fold[Take[E, Nothing]](end)(failCause), chunk)
 
   /**
    * Creates a failing `Take[Nothing, Nothing]` with the specified throwable.
@@ -141,7 +142,7 @@ object Take {
    * Creates a `Take[E, A]` from `Exit[E, A]`.
    */
   def done[E, A](exit: Exit[E, A]): Take[E, A] =
-    Take(exit.mapError[Option[E]](Some(_)).map(Chunk.single))
+    Take(exit.mapErrorExit[Option[E]]((e: E) => Some(e)).mapExit(Chunk.single))
 
   /**
    * End-of-stream marker

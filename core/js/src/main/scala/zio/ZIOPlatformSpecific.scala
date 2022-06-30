@@ -16,6 +16,8 @@
 
 package zio
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 import scala.scalajs.js
 import scala.scalajs.js.{Function1, Promise => JSPromise, Thenable, |}
 
@@ -24,30 +26,43 @@ private[zio] trait ZIOPlatformSpecific[-R, +E, +A] { self: ZIO[R, E, A] =>
   /**
    * Converts the current `ZIO` to a Scala.js promise.
    */
-  def toPromiseJS(implicit ev: E <:< Throwable): URIO[R, JSPromise[A]] =
+  def toPromiseJS(implicit ev: E IsSubtypeOfError Throwable, trace: Trace): URIO[R, JSPromise[A]] =
     toPromiseJSWith(ev)
 
   /**
    * Converts the current `ZIO` to a Scala.js promise and maps the error type
    * with `f`.
    */
-  def toPromiseJSWith(f: E => Throwable): URIO[R, JSPromise[A]] =
+  def toPromiseJSWith(f: E => Throwable)(implicit trace: Trace): URIO[R, JSPromise[A]] =
     self.foldCause(c => JSPromise.reject(c.squashWith(f)), JSPromise.resolve[A](_))
 }
 
 private[zio] trait ZIOCompanionPlatformSpecific { self: ZIO.type =>
 
   /**
+   * Imports a synchronous effect that does blocking IO into a pure value.
+   *
+   * If the returned `ZIO` is interrupted, the blocked thread running the
+   * synchronous effect will be interrupted via `Thread.interrupt`.
+   *
+   * Note that this adds significant overhead. For performance sensitive
+   * applications consider using `attemptBlocking` or
+   * `attemptBlockingCancelable`.
+   */
+  def attemptBlockingInterrupt[A](effect: => A)(implicit trace: Trace): Task[A] =
+    ZIO.attemptBlocking(effect)
+
+  /**
    * Imports a Scala.js promise into a `ZIO`.
    */
-  def fromPromiseJS[A](promise: => JSPromise[A]): Task[A] =
-    self.effectAsync { callback =>
+  def fromPromiseJS[A](promise: => JSPromise[A])(implicit trace: Trace): Task[A] =
+    self.async { callback =>
       val onFulfilled: Function1[A, Unit | Thenable[Unit]] = new scala.Function1[A, Unit | Thenable[Unit]] {
-        def apply(a: A): Unit | Thenable[Unit] = callback(UIO.succeedNow(a))
+        def apply(a: A): Unit | Thenable[Unit] = callback(ZIO.succeedNow(a))
       }
       val onRejected: Function1[Any, Unit | Thenable[Unit]] = new scala.Function1[Any, Unit | Thenable[Unit]] {
         def apply(e: Any): Unit | Thenable[Unit] =
-          callback(IO.fail(e match {
+          callback(ZIO.fail(e match {
             case t: Throwable => t
             case _            => js.JavaScriptException(e)
           }))

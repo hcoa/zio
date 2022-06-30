@@ -16,7 +16,7 @@
 
 package zio.test
 
-import zio.duration._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.test.TestAnnotationRenderer._
 
 /**
@@ -128,8 +128,8 @@ object TestAnnotationRenderer {
    * time.
    */
   val timed: TestAnnotationRenderer =
-    LeafRenderer(TestAnnotation.timing) { case (child :: ancestors) =>
+    LeafRenderer(TestAnnotation.timing) { case (child :: _) =>
       if (child.isZero) None
-      else Some(f"${child.render} (${(child.toNanos.toDouble / (child :: ancestors).last.toNanos) * 100}%2.2f%%)")
+      else Some(f"${child.render}")
     }
 }

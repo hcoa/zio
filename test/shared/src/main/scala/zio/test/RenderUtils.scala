@@ -16,6 +16,8 @@
 
 package zio.test
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 import scala.{Console => SConsole}
 
 private[test] object ConsoleUtils {
@@ -46,4 +48,6 @@ private[test] object ConsoleUtils {
   def bold(s: String): String =
     SConsole.BOLD + s + SConsole.RESET
 
+  def ansi(ansiColor: String, s: String): String =
+    ansiColor + s + SConsole.RESET
 }

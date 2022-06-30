@@ -17,31 +17,46 @@
 package zio.stream
 
 import zio._
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 /**
- * A `SubscriptionRef[A]` contains a `RefM` with a value of type `A` and a
- * `ZStream` that can be subscribed to in order to receive the current value as
- * well as all changes to the value.
+ * A `SubscriptionRef[A]` is a `Ref` that can be subscribed to in order to
+ * receive the current value as well as all changes to the value.
  */
-final class SubscriptionRef[A] private (val ref: RefM[A], val changes: Stream[Nothing, A])
+trait SubscriptionRef[A] extends Ref.Synchronized[A] {
+
+  /**
+   * A stream containing the current value of the `Ref` as well as all changes
+   * to that value.
+   */
+  def changes: ZStream[Any, Nothing, A]
+}
 
 object SubscriptionRef {
 
   /**
    * Creates a new `SubscriptionRef` with the specified value.
    */
-  def make[A](a: A): UIO[SubscriptionRef[A]] =
+  def make[A](a: => A)(implicit trace: Trace): UIO[SubscriptionRef[A]] =
     for {
-      ref <- RefM.make(a)
+      ref <- Ref.Synchronized.make(a)
       hub <- Hub.unbounded[A]
-      changes = ZStream.unwrapManaged {
-                  ZManaged {
-                    ref.modify { a =>
-                      ZIO.succeedNow(a).zipWith(hub.subscribe.zio) { case (a, (finalizer, queue)) =>
-                        (finalizer, ZStream(a) ++ ZStream.fromQueue(queue))
-                      } <*> ZIO.succeedNow(a)
-                    }.uninterruptible
-                  }
-                }
-    } yield new SubscriptionRef(ref.tapInput(hub.publish), changes)
+    } yield new SubscriptionRef[A] {
+      def changes: ZStream[Any, Nothing, A] =
+        ZStream.unwrapScoped {
+          ref.modifyZIO { a =>
+            ZStream.fromHubScoped(hub).map { stream =>
+              (ZStream(a) ++ stream, a)
+            }
+          }
+        }
+      def get(implicit trace: Trace): UIO[A] =
+        ref.get
+      def modifyZIO[R, E, B](f: A => ZIO[R, E, (B, A)])(implicit trace: Trace): ZIO[R, E, B] =
+        ref.modifyZIO(a => f(a).tap { case (_, a) => hub.publish(a) })
+      def set(a: A)(implicit trace: Trace): UIO[Unit] =
+        ref.set(a)
+      def setAsync(a: A)(implicit trace: Trace): UIO[Unit] =
+        ref.setAsync(a)
+    }
 }

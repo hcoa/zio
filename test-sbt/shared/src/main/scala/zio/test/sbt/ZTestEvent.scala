@@ -1,7 +1,9 @@
 package zio.test.sbt
 
 import sbt.testing._
-import zio.test.{DefaultTestReporter, ExecutedSpec, TestAnnotation, TestAnnotationRenderer, TestFailure, TestSuccess}
+import zio.test.render.ConsoleRenderer
+import zio.test.render.LogLine.{Line, Message}
+import zio.test.{ExecutionEvent, TestAnnotation, TestSuccess}
 
 final case class ZTestEvent(
   fullyQualifiedName: String,
@@ -15,51 +17,36 @@ final case class ZTestEvent(
 }
 
 object ZTestEvent {
+  def convertEvent(test: ExecutionEvent.Test[_], taskDef: TaskDef): Event = {
+    val status = statusFrom(test)
+    val maybeThrowable = status match {
+      case Status.Failure =>
+        // Includes ansii colors
+        val failureMsg =
+          ConsoleRenderer
+            .renderToStringLines(Message(ConsoleRenderer.render(test, true).map(Line.fromString(_))))
+            .mkString("\n")
+        Some(new Exception(failureMsg))
+      case _ => None
+    }
 
-  def from[E](
-    executedSpec: ExecutedSpec[E],
-    fullyQualifiedName: String,
-    fingerprint: Fingerprint
-  ): Seq[ZTestEvent] = {
-
-    def loop(executedSpec: ExecutedSpec[E], label: Option[String]): Seq[ZTestEvent] =
-      executedSpec.caseValue match {
-        case ExecutedSpec.LabeledCase(label, spec) => loop(spec, Some(label))
-        case ExecutedSpec.MultipleCase(specs)      => specs.flatMap(loop(_, label))
-        case ExecutedSpec.TestCase(result, annotations) =>
-          Seq(
-            ZTestEvent(
-              fullyQualifiedName,
-              new TestSelector(label.getOrElse("")),
-              toStatus(result),
-              toThrowable(executedSpec, label, result),
-              annotations.get(TestAnnotation.timing).toMillis,
-              fingerprint
-            )
-          )
-      }
-
-    loop(executedSpec, None)
+    ZTestEvent(
+      fullyQualifiedName = taskDef.fullyQualifiedName(),
+      selector = new TestSelector(test.labels.mkString(" - ")),
+      status = status,
+      maybeThrowable = maybeThrowable,
+      duration = test.annotations.get(TestAnnotation.timing).toMillis,
+      fingerprint = ZioSpecFingerprint
+    )
   }
 
-  private def toStatus[E](result: Either[TestFailure[E], TestSuccess]) = result match {
-    case Left(_)                         => Status.Failure
-    case Right(TestSuccess.Succeeded(_)) => Status.Success
-    case Right(TestSuccess.Ignored)      => Status.Ignored
-  }
-
-  private def toThrowable[E](
-    spec: ExecutedSpec[E],
-    label: Option[String],
-    result: Either[TestFailure[E], TestSuccess]
-  ) = result.left.toOption.map {
-    case TestFailure.Assertion(_) => new AssertionError(render(spec, label))
-    case TestFailure.Runtime(_)   => new RuntimeException(render(spec, label))
-  }
-
-  private def render[E](spec: ExecutedSpec[E], label: Option[String]) = DefaultTestReporter
-    .render(label.fold(spec)(ExecutedSpec.labeled(_, spec)), TestAnnotationRenderer.default, includeCause = true)
-    .flatMap(_.rendered)
-    .mkString("\n")
-    .replaceAll("\u001B\\[[;\\d]*m", "")
+  private def statusFrom(test: ExecutionEvent.Test[_]): Status =
+    test.test match {
+      case Left(_) => Status.Failure
+      case Right(value) =>
+        value match {
+          case TestSuccess.Succeeded(_) => Status.Success
+          case TestSuccess.Ignored(_)   => Status.Ignored
+        }
+    }
 }

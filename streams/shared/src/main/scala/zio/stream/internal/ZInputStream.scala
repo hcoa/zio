@@ -16,7 +16,8 @@
 
 package zio.stream.internal
 
-import zio.{Chunk, Exit, FiberFailure, Runtime, ZIO}
+import zio.{Chunk, Exit, FiberFailure, Runtime, Trace, Unsafe, ZIO}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import scala.annotation.tailrec
 
@@ -107,9 +108,11 @@ private[zio] class ZInputStream(private var chunks: Iterator[Chunk[Byte]]) exten
 }
 
 private[zio] object ZInputStream {
-  def fromPull[R](runtime: Runtime[R], pull: ZIO[R, Option[Throwable], Chunk[Byte]]): ZInputStream = {
+  def fromPull[R](runtime: Runtime[R], pull: ZIO[R, Option[Throwable], Chunk[Byte]])(implicit
+    trace: Trace
+  ): ZInputStream = {
     def unfoldPull: Iterator[Chunk[Byte]] =
-      runtime.unsafeRunSync(pull) match {
+      runtime.unsafe.run(pull)(trace, Unsafe.unsafe) match {
         case Exit.Success(chunk) => Iterator.single(chunk) ++ unfoldPull
         case Exit.Failure(cause) =>
           cause.failureOrCause match {
@@ -118,6 +121,7 @@ private[zio] object ZInputStream {
             case Right(c)      => throw FiberFailure(c)
           }
       }
+
     new ZInputStream(Iterator.empty ++ unfoldPull)
   }
 }

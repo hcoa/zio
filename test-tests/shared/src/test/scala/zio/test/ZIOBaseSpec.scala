@@ -1,10 +1,9 @@
 package zio.test
 
-import zio.duration._
-import zio.test.environment.Live
+import zio._
 
-trait ZIOBaseSpec extends DefaultRunnableSpec {
-  override def aspects: List[TestAspectAtLeastR[Live]] =
-    if (TestPlatform.isJVM) List(TestAspect.timeout(60.seconds))
-    else List(TestAspect.sequential, TestAspect.timeout(60.seconds))
+trait ZIOBaseSpec extends ZIOSpecDefault {
+  override def aspects: Chunk[TestAspectAtLeastR[TestEnvironment]] =
+    if (TestPlatform.isJVM) Chunk(TestAspect.timeout(120.seconds))
+    else Chunk(TestAspect.timeout(120.seconds), TestAspect.sequential)
 }

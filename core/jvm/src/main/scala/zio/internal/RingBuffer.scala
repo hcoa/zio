@@ -17,11 +17,12 @@
 package zio.internal
 
 import zio.internal.MutableQueueFieldsPadding.{headUpdater, tailUpdater}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 import zio.{Chunk, ChunkBuilder}
 
 import java.util.concurrent.atomic.AtomicLongArray
 
-object RingBuffer {
+private[zio] object RingBuffer {
 
   /**
    * @note
@@ -149,7 +150,9 @@ object RingBuffer {
  * translates into worse performance on average, and better performance in some
  * very specific situations.
  */
-abstract class RingBuffer[A](override final val capacity: Int) extends MutableQueueFieldsPadding[A] with Serializable {
+private[zio] abstract class RingBuffer[A](override final val capacity: Int)
+    extends MutableQueueFieldsPadding[A]
+    with Serializable {
   import RingBuffer.{STATE_EMPTY, STATE_FULL, STATE_LOOP, STATE_RESERVED}
 
   private val buf: Array[AnyRef]   = new Array[AnyRef](capacity)
@@ -241,7 +244,7 @@ abstract class RingBuffer[A](override final val capacity: Int) extends MutableQu
     }
   }
 
-  override final def offerAll(as: Iterable[A]): Chunk[A] = {
+  override final def offerAll[A1 <: A](as: Iterable[A1]): Chunk[A1] = {
     val aCapacity = capacity
 
     val aSeq   = seq

@@ -35,15 +35,12 @@ _These articles reflect the state of ZIO at the time of their publication. The c
 - [Building the Death Star with ZIO Stream](https://juliano-alves.com/2020/05/04/deathstar-zio-stream/) by Juliano Alves (May 2020)
 - [Simulating IoT Events with ZIO Streams](https://timpigden.github.io/_pages/zio-streams/GeneratingChillEvents.html) by Tim Pigden (November 2019)
 
-## ZIO Module Pattern
+## ZIO Service Pattern
 - [Example of ZLayers being used in combination](https://timpigden.github.io/_pages/zlayer/Examples.html) by Tim Pigden (March 2020)
 - [From idea to product with ZLayer](https://scala.monster/welcome-zio/) by Pavels Sisojevs (March 2020)
 - [What are the benefits of the ZIO modules with ZLayers](https://medium.com/@pascal.mengelt/what-are-the-benefits-of-the-zio-modules-with-zlayers-3bf6cc064a9b) by Pascal Mengelt (March 2020)
 - [Decouple the Program from its Implementation with ZIO modules.](https://medium.com/@pascal.mengelt/decouple-the-program-from-its-implementation-with-zio-modules-d9b8713d502e) by Pascal Mengelt (December 2019)
 - [Functional dependency injection in Scala using ZIO environments](https://blog.jdriven.com/2019/10/functional-dependency-injection-in-scala-using-zio-environments/) by Chiel van de Steeg (October 2019)
-
-## ZIO Libraries
-- [Introduction to ZIO Actors](https://www.softinio.com/post/introduction-to-zio-actors/) by [Salar Rahmanian](https://www.softinio.com) (November 2020)
 
 ## ZIO Use Cases
 - [Implement your future with ZIO](https://scala.monster/welcome-zio-old/) by Pavels Sisojevs (December 2019)

@@ -9,27 +9,28 @@ object FiberSpec extends ZIOBaseSpec {
 
   import ZIOTag._
 
-  def spec: ZSpec[Environment, Failure] =
+  def spec =
     suite("FiberSpec")(
-      suite("Create a new Fiber and")(testM("lift it into Managed") {
+      suite("Create a new Fiber and")(test("scope it") {
         for {
-          ref   <- Ref.make(false)
-          fiber <- withLatch(release => (release *> IO.unit).bracket_(ref.set(true))(IO.never).fork)
-          _     <- fiber.toManaged.use(_ => IO.unit)
+          ref <- Ref.make(false)
+          fiber <-
+            withLatch(release => ZIO.acquireReleaseWith(release *> ZIO.unit)(_ => ref.set(true))(_ => ZIO.never).fork)
+          _     <- ZIO.scoped(fiber.scoped)
           _     <- fiber.await
           value <- ref.get
         } yield assert(value)(isTrue)
       }),
       suite("`inheritLocals` works for Fiber created using:")(
-        testM("`map`") {
+        test("`map`") {
           for {
             fiberRef <- FiberRef.make(initial)
             child    <- withLatch(release => (fiberRef.set(update) *> release).fork)
-            _        <- child.map(_ => ()).inheritRefs
+            _        <- child.map(_ => ()).inheritAll
             value    <- fiberRef.get
           } yield assert(value)(equalTo(update))
         },
-        testM("`orElse`") {
+        test("`orElse`") {
           implicit val canFail = CanFail
           for {
             fiberRef <- FiberRef.make(initial)
@@ -38,11 +39,11 @@ object FiberSpec extends ZIOBaseSpec {
             child1   <- (fiberRef.set("child1") *> latch1.succeed(())).fork
             child2   <- (fiberRef.set("child2") *> latch2.succeed(())).fork
             _        <- latch1.await *> latch2.await
-            _        <- child1.orElse(child2).inheritRefs
+            _        <- child1.orElse(child2).inheritAll
             value    <- fiberRef.get
           } yield assert(value)(equalTo("child1"))
         },
-        testM("`zip`") {
+        test("`zip`") {
           for {
             fiberRef <- FiberRef.make(initial)
             latch1   <- Promise.make[Nothing, Unit]
@@ -50,42 +51,42 @@ object FiberSpec extends ZIOBaseSpec {
             child1   <- (fiberRef.set("child1") *> latch1.succeed(())).fork
             child2   <- (fiberRef.set("child2") *> latch2.succeed(())).fork
             _        <- latch1.await *> latch2.await
-            _        <- child1.zip(child2).inheritRefs
+            _        <- child1.zip(child2).inheritAll
             value    <- fiberRef.get
           } yield assert(value)(equalTo("child1"))
         }
       ),
       suite("`Fiber.join` on interrupted Fiber")(
-        testM("is inner interruption") {
-          val fiberId = Fiber.Id(0L, 123L)
+        test("is inner interruption") {
+          val fiberId = FiberId.Runtime(0, 123, Trace.empty)
 
           for {
-            exit <- Fiber.interruptAs(fiberId).join.run
+            exit <- Fiber.interruptAs(fiberId).join.exit
           } yield assert(exit)(equalTo(Exit.interrupt(fiberId)))
         }
       ) @@ zioTag(interruption),
       suite("if one composed fiber fails then all must fail")(
-        testM("`await`") {
+        test("`await`") {
           for {
             exit <- Fiber.fail("fail").zip(Fiber.never).await
           } yield assert(exit)(fails(equalTo("fail")))
         },
-        testM("`join`") {
+        test("`join`") {
           for {
-            exit <- Fiber.fail("fail").zip(Fiber.never).join.run
+            exit <- Fiber.fail("fail").zip(Fiber.never).join.exit
           } yield assert(exit)(fails(equalTo("fail")))
         },
-        testM("`awaitAll`") {
+        test("`awaitAll`") {
           for {
-            exit <- Fiber.awaitAll(Fiber.fail("fail") :: List.fill(100)(Fiber.never)).run
+            exit <- Fiber.awaitAll(Fiber.fail("fail") :: List.fill(100)(Fiber.never)).exit
           } yield assert(exit)(succeeds(isUnit))
         },
-        testM("`joinAll`") {
+        test("`joinAll`") {
           for {
-            exit <- Fiber.awaitAll(Fiber.fail("fail") :: List.fill(100)(Fiber.never)).run
+            exit <- Fiber.awaitAll(Fiber.fail("fail") :: List.fill(100)(Fiber.never)).exit
           } yield assert(exit)(succeeds(isUnit))
         },
-        testM("shard example") {
+        test("shard example") {
           def shard[R, E, A](queue: Queue[A], n: Int, worker: A => ZIO[R, E, Unit]): ZIO[R, E, Nothing] = {
             val worker1: ZIO[R, E, Unit] = queue.take.flatMap(a => worker(a).uninterruptible).forever
             ZIO.forkAll(List.fill(n)(worker1)).flatMap(_.join) *> ZIO.never
@@ -94,55 +95,64 @@ object FiberSpec extends ZIOBaseSpec {
             queue <- Queue.unbounded[Int]
             _     <- queue.offerAll(1 to 100)
             worker = (n: Int) => if (n == 100) ZIO.fail("fail") else queue.offer(n).unit
-            exit  <- shard(queue, 4, worker).run
+            exit  <- shard(queue, 4, worker).exit
             _     <- queue.shutdown
           } yield assert(exit)(fails(equalTo("fail")))
         }
       ) @@ zioTag(errors),
-      testM("grandparent interruption is propagated to grandchild despite parent termination") {
+      test("child becoming interruptible is interrupted due to auto-supervision of uninterruptible parent") {
         for {
-          latch1 <- Promise.make[Nothing, Unit]
-          latch2 <- Promise.make[Nothing, Unit]
-          c       = ZIO.never.interruptible.onInterrupt(latch2.succeed(()))
-          a       = (latch1.succeed(()) *> c.fork.fork).uninterruptible *> ZIO.never
-          fiber  <- a.fork
-          _      <- latch1.await
-          _      <- fiber.interrupt
-          _      <- latch2.await
+          latch <- Promise.make[Nothing, Unit]
+          child  = ZIO.never.interruptible.onInterrupt(latch.succeed(())).fork
+          _     <- child.fork.uninterruptible
+          _     <- latch.await
         } yield assertCompletes
       } @@ zioTag(interruption) @@ nonFlaky,
+      suite("roots")(
+        test("dual roots") {
+          def rootContains(f: Fiber.Runtime[_, _]): UIO[Boolean] =
+            Fiber.roots.map(_.contains(f))
+
+          for {
+            fiber1 <- ZIO.never.forkDaemon
+            fiber2 <- ZIO.never.forkDaemon
+            _      <- (rootContains(fiber1) && rootContains(fiber2)).repeatUntil(_ == true)
+            _      <- fiber1.interrupt *> fiber2.interrupt
+          } yield assertCompletes
+        }
+      ),
       suite("stack safety")(
-        testM("awaitAll") {
-          assertM(Fiber.awaitAll(fibers))(anything)
+        test("awaitAll") {
+          assertZIO(Fiber.awaitAll(fibers))(anything)
         },
-        testM("joinAll") {
-          assertM(Fiber.joinAll(fibers))(anything)
+        test("joinAll") {
+          assertZIO(Fiber.joinAll(fibers))(anything)
         },
-        testM("collectAll") {
-          assertM(Fiber.collectAll(fibers).join)(anything)
+        test("collectAll") {
+          assertZIO(Fiber.collectAll(fibers).join)(anything)
         }
       ) @@ sequential,
       suite("track blockingOn")(
-        testM("in await") {
+        test("in await") {
           for {
             f1 <- ZIO.never.fork
             f2 <- f1.await.fork
             blockingOn <- f2.status
-                            .collect(()) { case Fiber.Status.Suspended(_, _, _, blockingOn, _) =>
+                            .collect(()) { case Fiber.Status.Suspended(_, _, blockingOn) =>
                               blockingOn
                             }
                             .eventually
-          } yield assert(blockingOn)(equalTo(List(f1.id)))
+          } yield assertTrue(blockingOn == f1.id)
         },
-        testM("in race") {
+        test("in race") {
           for {
-            f <- ZIO.never.race(ZIO.never).fork
+            f <- ZIO.infinity.race(ZIO.infinity).fork
             blockingOn <- f.status
-                            .collect(()) { case Fiber.Status.Suspended(_, _, _, blockingOn, _) =>
+                            .collect(()) { case Fiber.Status.Suspended(_, _, blockingOn) =>
                               blockingOn
                             }
                             .eventually
-          } yield assert(blockingOn)(hasSize(equalTo(2)))
+          } yield assertTrue(blockingOn.toSet.size == 2)
         }
       )
     )

@@ -1,102 +1,357 @@
 package zio.stream
 
-import zio.duration._
-import zio.stream.SinkUtils.{findSink, sinkRaceLaw}
-import zio.stream.ZStreamGen._
-import zio.test.Assertion.{equalTo, isFalse, isGreaterThanEqualTo, isLeft, isTrue, isUnit, succeeds}
-import zio.test.environment.TestClock
-import zio.test.{assertM, _}
-import zio.{ZIOBaseSpec, _}
-
-import scala.util.Random
+import zio._
+import zio.stream.SinkUtils._
+import zio.test.Assertion._
+import zio.test.TestAspect.jvmOnly
+import zio.test._
 
 object ZSinkSpec extends ZIOBaseSpec {
-  def spec: ZSpec[Environment, Failure] = suite("ZSinkSpec")(
-    suite("Constructors")(
-      testM("collectAllToSet")(
-        assertM(
-          ZStream(1, 2, 3, 3, 4)
-            .run(ZSink.collectAllToSet[Int])
-        )(equalTo(Set(1, 2, 3, 4)))
-      ),
-      testM("collectAllToMap")(
-        assertM(
-          ZStream
-            .range(0, 10)
-            .run(ZSink.collectAllToMap((_: Int) % 3)(_ + _))
-        )(equalTo(Map[Int, Int](0 -> 18, 1 -> 12, 2 -> 15)))
-      ),
-      suite("accessSink")(
-        testM("accessSink") {
-          assertM(
-            ZStream("ignore this")
-              .run(ZSink.accessSink[String](ZSink.succeed[String, String](_)).provide("use this"))
-          )(equalTo("use this"))
-        }
-      ),
-      suite("collectAllWhileWith")(
-        testM("example 1") {
-          ZIO
-            .foreach(List(1, 3, 20)) { chunkSize =>
-              assertM(
-                Stream
-                  .fromIterable(1 to 10)
-                  .chunkN(chunkSize)
-                  .run(ZSink.sum[Int].collectAllWhileWith(-1)((s: Int) => s == s)(_ + _))
-              )(equalTo(54))
-            }
-            .map(_.reduce(_ && _))
-        },
-        testM("example 2") {
-          val sink: ZSink[Any, Nothing, Int, Int, List[Int]] = ZSink
-            .head[Int]
-            .collectAllWhileWith[List[Int]](Nil)((a: Option[Int]) => a.fold(true)(_ < 5))(
-              (a: List[Int], b: Option[Int]) => a ++ b.toList
-            )
-          val stream = Stream.fromIterable(1 to 100)
-          assertM((stream ++ stream).chunkN(3).run(sink))(equalTo(List(1, 2, 3, 4)))
-        }
-      ),
-      testM("head")(
-        checkM(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.anyInt)))) { chunks =>
-          val headOpt = ZStream.fromChunks(chunks: _*).run(ZSink.head[Int])
-          assertM(headOpt)(equalTo(chunks.flatMap(_.toSeq).headOption))
-        }
-      ),
-      testM("last")(
-        checkM(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.anyInt)))) { chunks =>
-          val lastOpt = ZStream.fromChunks(chunks: _*).run(ZSink.last[Int])
-          assertM(lastOpt)(equalTo(chunks.flatMap(_.toSeq).lastOption))
-        }
-      ),
-      suite("managed")(
-        testM("happy path") {
-          for {
-            closed <- Ref.make[Boolean](false)
-            res     = ZManaged.make(ZIO.succeed(100))(_ => closed.set(true))
-            sink: ZSink[Any, Nothing, Int, Int, (Long, Boolean)] =
-              ZSink.managed(res)(m => ZSink.count.mapM(cnt => closed.get.map(cl => (cnt + m, cl))))
-            resAndState <- ZStream(1, 2, 3).run(sink)
-            finalState  <- closed.get
-          } yield {
-            assert(resAndState._1)(equalTo(103L)) && assert(resAndState._2)(isFalse) && assert(finalState)(isTrue)
+
+  import ZIOTag._
+
+  def spec = {
+    suite("ZSinkSpec")(
+      suite("Constructors")(
+        suite("drain")(
+          test("fails if upstream fails") {
+            ZStream(1)
+              .mapZIO(_ => ZIO.fail("boom!"))
+              .run(ZSink.drain)
+              .exit
+              .map(assert(_)(fails(equalTo("boom!"))))
           }
-        },
-        testM("sad path") {
-          for {
-            closed     <- Ref.make[Boolean](false)
-            res         = ZManaged.make(ZIO.succeed(100))(_ => closed.set(true))
-            sink        = ZSink.managed(res)(_ => ZSink.succeed[Int, String]("ok"))
-            r          <- ZStream.fail("fail").run(sink).either
-            finalState <- closed.get
-          } yield assert(r)(equalTo(Left("fail"))) && assert(finalState)(isTrue)
-        }
+        ),
+        suite("collectAllN")(
+          test("respects the given limit") {
+            ZStream
+              .fromChunk(Chunk(1, 2, 3, 4))
+              .transduce(ZSink.collectAllN[Int](3))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Chunk(1, 2, 3), Chunk(4)))))
+          },
+          test("produces empty trailing chunks") {
+            ZStream
+              .fromChunk(Chunk(1, 2, 3, 4))
+              .transduce(ZSink.collectAllN[Int](4))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Chunk(1, 2, 3, 4), Chunk()))))
+          },
+          test("handles empty input") {
+            ZStream
+              .fromChunk(Chunk.empty: Chunk[Int])
+              .transduce(ZSink.collectAllN[Int](3))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Chunk()))))
+          }
+        ),
+        test("collectAllToSet")(
+          assertZIO(
+            ZStream(1, 2, 3, 3, 4)
+              .run(ZSink.collectAllToSet[Int])
+          )(equalTo(Set(1, 2, 3, 4)))
+        ),
+        suite("collectAllToSetN")(
+          test("respect the given limit") {
+            ZStream
+              .fromChunks(Chunk(1, 2, 1), Chunk(2, 3, 3, 4))
+              .transduce(ZSink.collectAllToSetN[Int](3))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Set(1, 2, 3), Set(4)))))
+          },
+          test("handles empty input") {
+            ZStream
+              .fromChunk(Chunk.empty: Chunk[Int])
+              .transduce(ZSink.collectAllToSetN[Int](3))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Set.empty[Int]))))
+          }
+        ),
+        test("collectAllToMap")(
+          assertZIO(
+            ZStream
+              .range(0, 10)
+              .run(ZSink.collectAllToMap((_: Int) % 3)(_ + _))
+          )(equalTo(Map[Int, Int](0 -> 18, 1 -> 12, 2 -> 15)))
+        ),
+        suite("collectAllToMapN")(
+          test("respects the given limit") {
+            ZStream
+              .fromChunk(Chunk(1, 1, 2, 2, 3, 2, 4, 5))
+              .transduce(ZSink.collectAllToMapN(2)((_: Int) % 3)(_ + _))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Map(1 -> 2, 2 -> 4), Map(0 -> 3, 2 -> 2), Map(1 -> 4, 2 -> 5)))))
+          },
+          test("collects as long as map size doesn't exceed the limit") {
+            ZStream
+              .fromChunks(Chunk(0, 1, 2), Chunk(3, 4, 5), Chunk(6, 7, 8, 9))
+              .transduce(ZSink.collectAllToMapN(3)((_: Int) % 3)(_ + _))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Map(0 -> 18, 1 -> 12, 2 -> 15)))))
+          },
+          test("handles empty input") {
+            ZStream
+              .fromChunk(Chunk.empty: Chunk[Int])
+              .transduce(ZSink.collectAllToMapN(2)((_: Int) % 3)(_ + _))
+              .runCollect
+              .map(assert(_)(equalTo(Chunk(Map.empty[Int, Int]))))
+          }
+        ),
+        test("dropUntil")(
+          assertZIO(
+            ZStream(1, 2, 3, 4, 5, 1, 2, 3, 4, 5)
+              .pipeThrough(ZSink.dropUntil[Int](_ >= 3))
+              .runCollect
+          )(equalTo(Chunk(4, 5, 1, 2, 3, 4, 5)))
+        ),
+        suite("dropUntilZIO")(
+          test("happy path")(
+            assertZIO(
+              ZStream(1, 2, 3, 4, 5, 1, 2, 3, 4, 5)
+                .pipeThrough(ZSink.dropUntilZIO(x => ZIO.succeed(x >= 3)))
+                .runCollect
+            )(equalTo(Chunk(4, 5, 1, 2, 3, 4, 5)))
+          ),
+          test("error")(
+            assertZIO {
+              (ZStream(1, 2, 3) ++ ZStream.fail("Aie") ++ ZStream(5, 1, 2, 3, 4, 5))
+                .pipeThrough(ZSink.dropUntilZIO[Any, String, Int](x => ZIO.succeed(x >= 2)))
+                .either
+                .runCollect
+            }(equalTo(Chunk(Right(3), Left("Aie"))))
+          )
+        ),
+        test("dropWhile")(
+          assertZIO(
+            ZStream(1, 2, 3, 4, 5, 1, 2, 3, 4, 5)
+              .pipeThrough(ZSink.dropWhile[Int](_ < 3))
+              .runCollect
+          )(equalTo(Chunk(3, 4, 5, 1, 2, 3, 4, 5)))
+        ),
+        suite("dropWhileZIO")(
+          test("happy path")(
+            assertZIO(
+              ZStream(1, 2, 3, 4, 5, 1, 2, 3, 4, 5)
+                .dropWhileZIO(x => ZIO.succeed(x < 3))
+                .runCollect
+            )(equalTo(Chunk(3, 4, 5, 1, 2, 3, 4, 5)))
+          ),
+          test("error")(
+            assertZIO {
+              (ZStream(1, 2, 3) ++ ZStream.fail("Aie") ++ ZStream(5, 1, 2, 3, 4, 5))
+                .pipeThrough(ZSink.dropWhileZIO[Any, String, Int](x => ZIO.succeed(x < 3)))
+                .either
+                .runCollect
+            }(equalTo(Chunk(Right(3), Left("Aie"))))
+          )
+        ),
+        suite("environmentWithSink")(
+          test("environmentWithSink") {
+            assertZIO(
+              ZStream("ignore this")
+                .run(
+                  ZSink
+                    .environmentWithSink[String](environment => ZSink.succeed(environment.get))
+                    .provideEnvironment(ZEnvironment("use this"))
+                )
+            )(equalTo("use this"))
+          }
+        ),
+        suite("collectAllWhileWith")(
+          test("example 1") {
+            ZIO
+              .foreach(List(1, 3, 20)) { chunkSize =>
+                assertZIO(
+                  ZStream
+                    .fromChunk(Chunk.fromIterable(1 to 10))
+                    .rechunk(chunkSize)
+                    .run(ZSink.sum[Int].collectAllWhileWith(-1)((s: Int) => s == s)(_ + _))
+                )(equalTo(54))
+              }
+              .map(_.reduce(_ && _))
+          },
+          test("example 2") {
+            val sink = ZSink
+              .head[Int]
+              .collectAllWhileWith[List[Int]](Nil)((a: Option[Int]) => a.fold(true)(_ < 5))(
+                (a: List[Int], b: Option[Int]) => a ++ b.toList
+              )
+            val stream = ZStream.fromChunk(Chunk.fromIterable(1 to 100))
+            assertZIO((stream ++ stream).rechunk(3).run(sink))(equalTo(List(1, 2, 3, 4)))
+          }
+        ),
+        test("head")(
+          check(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.int)))) { chunks =>
+            val headOpt = ZStream.fromChunks(chunks: _*).run(ZSink.head[Int])
+            assertZIO(headOpt)(equalTo(chunks.flatMap(_.toSeq).headOption))
+          }
+        ),
+        test("last")(
+          check(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.int)))) { chunks =>
+            val lastOpt = ZStream.fromChunks(chunks: _*).run(ZSink.last)
+            assertZIO(lastOpt)(equalTo(chunks.flatMap(_.toSeq).lastOption))
+          }
+        ),
+        suite("unwrapScoped")(
+          test("happy path") {
+            for {
+              closed <- Ref.make[Boolean](false)
+              res     = ZIO.acquireRelease(ZIO.succeed(100))(_ => closed.set(true))
+              sink =
+                ZSink.unwrapScoped(res.map(m => ZSink.count.mapZIO(cnt => closed.get.map(cl => (cnt + m, cl)))))
+              resAndState <- ZStream(1, 2, 3).run(sink)
+              finalState  <- closed.get
+            } yield {
+              assert(resAndState._1)(equalTo(103L)) && assert(resAndState._2)(isFalse) && assert(finalState)(isTrue)
+            }
+          },
+          test("sad path") {
+            for {
+              closed     <- Ref.make[Boolean](false)
+              res         = ZIO.acquireRelease(ZIO.succeed(100))(_ => closed.set(true))
+              sink        = ZSink.unwrapScoped(res.map(_ => ZSink.succeed("ok")))
+              r          <- ZStream.fail("fail").run(sink)
+              finalState <- closed.get
+            } yield assert(r)(equalTo("ok")) && assert(finalState)(isTrue)
+          }
+        )
       ),
-      testM("foldLeft")(
-        checkM(
-          Gen.small(pureStreamGen(Gen.anyInt, _)),
-          Gen.function2(Gen.anyString),
-          Gen.anyString
+      test("map")(
+        assertZIO(ZStream.range(1, 10).run(ZSink.succeed(1).map(_.toString)))(
+          equalTo("1")
+        )
+      ),
+      suite("mapZIO")(
+        test("happy path")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.succeed(1).mapZIO(e => ZIO.succeed(e + 1))))(
+            equalTo(2)
+          )
+        ),
+        test("failure")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.succeed(1).mapZIO(_ => ZIO.fail("fail"))).flip)(
+            equalTo("fail")
+          )
+        )
+      ),
+      test("filterInput")(
+        assertZIO(ZStream.range(1, 10).run(ZSink.collectAll.filterInput(_ % 2 == 0)))(
+          equalTo(Chunk(2, 4, 6, 8))
+        )
+      ),
+      suite("filterInputZIO")(
+        test("happy path")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.collectAll.filterInputZIO(i => ZIO.succeed(i % 2 == 0))))(
+            equalTo(Chunk(2, 4, 6, 8))
+          )
+        ),
+        test("failure")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.collectAll.filterInputZIO(_ => ZIO.fail("fail"))).flip)(
+            equalTo("fail")
+          )
+        )
+      ),
+      test("mapError")(
+        assertZIO(ZStream.range(1, 10).run(ZSink.fail("fail").mapError(s => s + "!")).either)(
+          equalTo(Left("fail!"))
+        )
+      ),
+      test("as")(
+        assertZIO(ZStream.range(1, 10).run(ZSink.succeed(1).as("as")))(
+          equalTo("as")
+        )
+      ),
+      suite("contramap")(
+        test("happy path") {
+          val parser = ZSink.collectAll[Int].contramap[String](_.toInt)
+          assertZIO(ZStream("1", "2", "3").run(parser))(equalTo(Chunk(1, 2, 3)))
+        },
+        test("error") {
+          val parser = ZSink.fail("Ouch").contramap[String](_.toInt)
+          assertZIO(ZStream("1", "2", "3").run(parser).either)(isLeft(equalTo("Ouch")))
+        } @@ zioTag(errors)
+      ),
+      suite("contramapChunks")(
+        test("happy path") {
+          val parser = ZSink.collectAll[Int].contramapChunks[String](_.map(_.toInt))
+          assertZIO(ZStream("1", "2", "3").run(parser))(equalTo(Chunk(1, 2, 3)))
+        },
+        test("error") {
+          val parser = ZSink.fail("Ouch").contramapChunks[String](_.map(_.toInt))
+          assertZIO(ZStream("1", "2", "3").run(parser).either)(isLeft(equalTo("Ouch")))
+        } @@ zioTag(errors)
+      ),
+      suite("contramapZIO")(
+        test("happy path") {
+          val parser = ZSink.collectAll[Int].contramapZIO[Any, Throwable, String](a => ZIO.attempt(a.toInt))
+          assertZIO(ZStream("1", "2", "3").run(parser))(equalTo(Chunk(1, 2, 3)))
+        },
+        test("error") {
+          val parser = ZSink.fail("Ouch").contramapZIO[Any, String, String](a => ZIO.succeed(a.toInt))
+          assertZIO(ZStream("1", "2", "3").run(parser).either)(isLeft(equalTo("Ouch")))
+        } @@ zioTag(errors),
+        test("error in transformation") {
+          val parser = ZSink.collectAll[Int].contramapZIO[Any, Throwable, String](a => ZIO.attempt(a.toInt))
+          assertZIO(ZStream("1", "a").run(parser).either)(isLeft(hasMessage(equalTo("For input string: \"a\""))))
+        } @@ zioTag(errors)
+      ),
+      suite("contramapChunksZIO")(
+        test("happy path") {
+          val parser =
+            ZSink
+              .collectAll[Int]
+              .contramapChunksZIO[Any, Throwable, String](_.mapZIO(a => ZIO.attempt(a.toInt)))
+          assertZIO(ZStream("1", "2", "3").run(parser))(equalTo(Chunk(1, 2, 3)))
+        },
+        test("error") {
+          val parser =
+            ZSink.fail("Ouch").contramapChunksZIO[Any, String, String](_.mapZIO(a => ZIO.succeed(a.toInt)))
+          assertZIO(ZStream("1", "2", "3").run(parser).either)(isLeft(equalTo("Ouch")))
+        } @@ zioTag(errors),
+        test("error in transformation") {
+          val parser =
+            ZSink
+              .collectAll[Int]
+              .contramapChunksZIO[Any, Throwable, String](_.mapZIO(a => ZIO.attempt(a.toInt)))
+          assertZIO(ZStream("1", "a").run(parser).either)(isLeft(hasMessage(equalTo("For input string: \"a\""))))
+        } @@ zioTag(errors)
+      ),
+      test("collectAllUntil") {
+        val sink   = ZSink.collectAllUntil[Int](_ > 4)
+        val input  = List(Chunk(3, 4, 5, 6, 7, 2), Chunk.empty, Chunk(3, 4, 5, 6, 5, 4, 3, 2), Chunk.empty)
+        val result = ZStream.fromChunks(input: _*).transduce(sink).runCollect
+        assertZIO(result)(
+          equalTo(Chunk(Chunk(3, 4, 5), Chunk(6), Chunk(7), Chunk(2, 3, 4, 5), Chunk(6), Chunk(5), Chunk(4, 3, 2)))
+        )
+      },
+      test("collectAllUntilZIO") {
+        val sink   = ZSink.collectAllUntilZIO[Any, Nothing, Int]((i: Int) => ZIO.succeed(i > 4))
+        val input  = List(Chunk(3, 4, 5, 6, 7, 2), Chunk.empty, Chunk(3, 4, 5, 6, 5, 4, 3, 2), Chunk.empty)
+        val result = ZStream.fromChunks(input: _*).transduce(sink).runCollect
+        assertZIO(result)(
+          equalTo(Chunk(Chunk(3, 4, 5), Chunk(6), Chunk(7), Chunk(2, 3, 4, 5), Chunk(6), Chunk(5), Chunk(4, 3, 2)))
+        )
+      },
+      test("collectAllWhile") {
+        val sink   = ZSink.collectAllWhile[Int](_ < 5)
+        val input  = List(Chunk(3, 4, 5, 6, 7, 2), Chunk.empty, Chunk(3, 4, 5, 6, 5, 4, 3, 2), Chunk.empty)
+        val result = ZStream.fromChunks(input: _*).transduce(sink).runCollect
+        assertZIO(result)(
+          equalTo(Chunk(Chunk(3, 4), Chunk(), Chunk(), Chunk(2, 3, 4), Chunk(), Chunk(), Chunk(4, 3, 2)))
+        )
+      },
+      test("collectAllWhileZIO") {
+        val sink   = ZSink.collectAllWhileZIO[Any, Nothing, Int]((i: Int) => ZIO.succeed(i < 5))
+        val input  = List(Chunk(3, 4, 5, 6, 7, 2), Chunk.empty, Chunk(3, 4, 5, 6, 5, 4, 3, 2), Chunk.empty)
+        val result = ZStream.fromChunks(input: _*).transduce(sink).runCollect
+        assertZIO(result)(
+          equalTo(Chunk(Chunk(3, 4), Chunk(), Chunk(), Chunk(2, 3, 4), Chunk(), Chunk(), Chunk(4, 3, 2)))
+        )
+      },
+      test("foldLeft equivalence with Chunk#foldLeft")(
+        check(
+          Gen.small(ZStreamGen.pureStreamGen(Gen.int, _)),
+          Gen.function2(Gen.string),
+          Gen.string
         ) { (s, f, z) =>
           for {
             xs <- s.run(ZSink.foldLeft(z)(f))
@@ -104,233 +359,551 @@ object ZSinkSpec extends ZIOBaseSpec {
           } yield assert(xs)(equalTo(ys))
         }
       ),
-      testM("mapError")(
-        assertM(ZStream.range(1, 10).run(ZSink.fail[String, Int]("fail").mapError(s => s + "!")).either)(
-          equalTo(Left("fail!"))
-        )
+      suite("foldZIO")(
+        test("empty")(
+          assertZIO(
+            ZStream.empty
+              .transduce(
+                ZSink.foldZIO(0)(_ => true)((x, y: Int) => ZIO.succeed(x + y))
+              )
+              .runCollect
+          )(equalTo(Chunk(0)))
+        ),
+        test("short circuits") {
+          val empty: ZStream[Any, Nothing, Int]     = ZStream.empty
+          val single: ZStream[Any, Nothing, Int]    = ZStream.succeed(1)
+          val double: ZStream[Any, Nothing, Int]    = ZStream(1, 2)
+          val failed: ZStream[Any, String, Nothing] = ZStream.fail("Ouch")
+
+          def run[E](stream: ZStream[Any, E, Int]) =
+            (for {
+              effects <- Ref.make[List[Int]](Nil)
+              exit <- stream
+                        .transduce(ZSink.foldZIO(0)(_ => true) { (_, a: Int) =>
+                          effects.update(a :: _) *> ZIO.succeed(30)
+                        })
+                        .runCollect
+              result <- effects.get
+            } yield exit -> result).exit
+
+          (assertZIO(run(empty))(succeeds(equalTo((Chunk(0), Nil)))) <*>
+            assertZIO(run(single))(succeeds(equalTo((Chunk(30), List(1))))) <*>
+            assertZIO(run(double))(succeeds(equalTo((Chunk(30), List(2, 1))))) <*>
+            assertZIO(run(failed))(fails(equalTo("Ouch")))).map { case (r1, r2, r3, r4) =>
+            r1 && r2 && r3 && r4
+          }
+        },
+        test("equivalence with List#foldLeft") {
+          val ioGen = ZStreamGen.successes(Gen.string)
+          check(Gen.small(ZStreamGen.pureStreamGen(Gen.int, _)), Gen.function2(ioGen), ioGen) { (s, f, z) =>
+            for {
+              sinkResult <- z.flatMap(z => s.run(ZSink.foldLeftZIO(z)(f)))
+              foldResult <- s.runFold(List[Int]())((acc, el) => el :: acc)
+                              .map(_.reverse)
+                              .flatMap(_.foldLeft(z)((acc, el) => acc.flatMap(f(_, el))))
+                              .exit
+            } yield assert(foldResult.isSuccess)(isTrue) implies assert(foldResult)(succeeds(equalTo(sinkResult)))
+          }
+        }
       ),
       suite("fold")(
-        testM("termination in the middle")(
-          assertM(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= 5)((a, b) => a + b)))(equalTo(6))
+        test("empty")(
+          assertZIO(
+            ZStream.empty
+              .transduce(ZSink.fold[Int, Int](0)(_ => true)(_ + _))
+              .runCollect
+          )(equalTo(Chunk(0)))
         ),
-        testM("immediate termination")(
-          assertM(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= -1)((a, b) => a + b)))(equalTo(0))
+        test("short circuits") {
+          val empty: ZStream[Any, Nothing, Int]     = ZStream.empty
+          val single: ZStream[Any, Nothing, Int]    = ZStream.succeed(1)
+          val double: ZStream[Any, Nothing, Int]    = ZStream(1, 2)
+          val failed: ZStream[Any, String, Nothing] = ZStream.fail("Ouch")
+
+          def run[E](stream: ZStream[Any, E, Int]) =
+            (for {
+              effects <- Ref.make[List[Int]](Nil)
+              exit <- stream
+                        .transduce(ZSink.foldZIO(0)(_ => true) { (_, a: Int) =>
+                          effects.update(a :: _) *> ZIO.succeed(30)
+                        })
+                        .runCollect
+              result <- effects.get
+            } yield (exit, result)).exit
+
+          (assertZIO(run(empty))(succeeds(equalTo((Chunk(0), Nil)))) <*>
+            assertZIO(run(single))(succeeds(equalTo((Chunk(30), List(1))))) <*>
+            assertZIO(run(double))(succeeds(equalTo((Chunk(30), List(2, 1))))) <*>
+            assertZIO(run(failed))(fails(equalTo("Ouch")))).map { case (r1, r2, r3, r4) =>
+            r1 && r2 && r3 && r4
+          }
+        },
+        test("termination in the middle")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= 5)((a, b) => a + b)))(equalTo(6))
         ),
-        testM("termination in the middle")(
-          assertM(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= 500)((a, b) => a + b)))(equalTo(45))
+        test("immediate termination")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= -1)((a, b) => a + b)))(equalTo(0))
+        ),
+        test("termination in the middle")(
+          assertZIO(ZStream.range(1, 10).run(ZSink.fold[Int, Int](0)(_ <= 500)((a, b) => a + b)))(equalTo(45))
+        )
+      ),
+      test("foldUntil")(
+        assertZIO(
+          ZStream[Long](1, 1, 1, 1, 1, 1)
+            .transduce(ZSink.foldUntil(0L, 3)(_ + (_: Long)))
+            .runCollect
+        )(equalTo(Chunk(3L, 3L, 0L)))
+      ),
+      test("foldUntilZIO")(
+        assertZIO(
+          ZStream[Long](1, 1, 1, 1, 1, 1)
+            .transduce(ZSink.foldUntilZIO(0L, 3)((s, a: Long) => ZIO.succeedNow(s + a)))
+            .runCollect
+        )(equalTo(Chunk(3L, 3L, 0L)))
+      ),
+      test("foldWeighted")(
+        assertZIO(
+          ZStream[Long](1, 5, 2, 3)
+            .transduce(
+              ZSink.foldWeighted(List[Long]())((_, x: Long) => x * 2, 12)((acc, el) => el :: acc).map(_.reverse)
+            )
+            .runCollect
+        )(equalTo(Chunk(List(1L, 5L), List(2L, 3L))))
+      ),
+      suite("foldWeightedDecompose")(
+        test("simple example")(
+          assertZIO(
+            ZStream(1, 5, 1)
+              .transduce(
+                ZSink
+                  .foldWeightedDecompose(List[Int]())(
+                    (_, i: Int) => i.toLong,
+                    4,
+                    (i: Int) =>
+                      if (i > 1) Chunk(i - 1, 1)
+                      else Chunk(i)
+                  )((acc, el) => el :: acc)
+                  .map(_.reverse)
+              )
+              .runCollect
+          )(equalTo(Chunk(List(1, 3), List(1, 1, 1))))
+        ),
+        test("empty stream")(
+          assertZIO(
+            ZStream.empty
+              .transduce(
+                ZSink.foldWeightedDecompose(0)((_, x: Int) => x.toLong, 1000, Chunk.single(_: Int))(_ + _)
+              )
+              .runCollect
+          )(equalTo(Chunk(0)))
+        )
+      ),
+      test("foldWeightedZIO")(
+        assertZIO(
+          ZStream[Long](1, 5, 2, 3)
+            .transduce(
+              ZSink
+                .foldWeightedZIO(List.empty[Long])((_, a: Long) => ZIO.succeedNow(a * 2), 12)((acc, el) =>
+                  ZIO.succeedNow(el :: acc)
+                )
+                .map(_.reverse)
+            )
+            .runCollect
+        )(equalTo(Chunk(List(1L, 5L), List(2L, 3L))))
+      ),
+      suite("foldWeightedDecomposeZIO")(
+        test("simple example")(
+          assertZIO(
+            ZStream(1, 5, 1)
+              .transduce(
+                ZSink
+                  .foldWeightedDecomposeZIO(List.empty[Int])(
+                    (_, i: Int) => ZIO.succeedNow(i.toLong),
+                    4,
+                    (i: Int) =>
+                      ZIO.succeedNow(
+                        if (i > 1) Chunk(i - 1, 1)
+                        else Chunk(i)
+                      )
+                  )((acc, el) => ZIO.succeedNow(el :: acc))
+                  .map(_.reverse)
+              )
+              .runCollect
+          )(equalTo(Chunk(List(1, 3), List(1, 1, 1))))
+        ),
+        test("empty stream")(
+          assertZIO(
+            ZStream.empty
+              .transduce(
+                ZSink.foldWeightedDecomposeZIO[Any, Nothing, Int, Int](0)(
+                  (_, x) => ZIO.succeed(x.toLong),
+                  1000,
+                  x => ZIO.succeed(Chunk.single(x))
+                )((x, y) => ZIO.succeed(x + y))
+              )
+              .runCollect
+          )(equalTo(Chunk(0)))
         )
       ),
       suite("fail")(
-        testM("handles leftovers") {
-          val s: ZSink[Any, Nothing, Int, Nothing, (Chunk[Int], String)] =
+        test("handles leftovers") {
+          val s =
             ZSink
-              .fail[String, Int]("boom")
-              .foldM(err => ZSink.collectAll.map(c => (c, err)), _ => sys.error("impossible"))
-          assertM(ZStream(1, 2, 3).run(s))(equalTo((Chunk(1, 2, 3), "boom")))
+              .fail("boom")
+              .foldSink(err => ZSink.collectAll[Int].map(c => (c, err)), _ => sys.error("impossible"))
+          assertZIO(ZStream(1, 2, 3).run(s))(equalTo((Chunk(1, 2, 3), "boom")))
         }
       ),
-      suite("foldM")(
-        testM("foldM") {
-          val ioGen = successes(Gen.anyString)
-          checkM(Gen.small(pureStreamGen(Gen.anyInt, _)), Gen.function2(ioGen), ioGen) { (s, f, z) =>
-            for {
-              sinkResult <- z.flatMap(z => s.run(ZSink.foldLeftM(z)(f)))
-              foldResult <- s.fold(List[Int]())((acc, el) => el :: acc)
-                              .map(_.reverse)
-                              .flatMap(_.foldLeft(z)((acc, el) => acc.flatMap(f(_, el))))
-                              .run
-            } yield assert(foldResult.succeeded)(isTrue) implies assert(foldResult)(succeeds(equalTo(sinkResult)))
-          }
-        }
-      ),
-      suite("foreach")(
-        testM("preserves leftovers in case of failure") {
-          for {
-            acc <- Ref.make[Int](0)
-            s    = ZSink.foreach[Any, String, Int]((i: Int) => if (i == 4) ZIO.fail("boom") else acc.update(_ + i))
-            sink: ZSink[Any, Nothing, Int, Nothing, Chunk[Int]] =
-              s
-                .foldM(_ => ZSink.collectAll, _ => sys.error("impossible"))
-            leftover <- ZStream.fromChunks(Chunk(1, 2), Chunk(3, 4, 5)).run(sink)
-            sum      <- acc.get
-          } yield {
-            assert(sum)(equalTo(6)) && assert(leftover)(equalTo(Chunk(5)))
-          }
-        }
-      ),
+      // suite("foreach")(
+      //   test("preserves leftovers in case of failure") {
+      //     for {
+      //       acc <- Ref.make[Int](0)
+      //       s    = ZSink.foreach[Any, String, Int]((i: Int) => if (i == 4) ZIO.fail("boom") else acc.update(_ + i))
+      //       sink = s.foldSink(_ => ZSink.collectAll[String, Int], _ => sys.error("impossible"))
+      //       leftover <- ZStream.fromChunks(Chunk(1, 2), Chunk(3, 4, 5)).run(sink)
+      //       sum      <- acc.get
+      //     } yield {
+      //       assert(sum)(equalTo(6)) && assert(leftover)(equalTo(Chunk(5)))
+      //     }
+      //   }
+      // ),
       suite("foreachWhile")(
-        testM("handles leftovers") {
+        test("handles leftovers") {
           val leftover = ZStream
             .fromIterable(1 to 5)
-            .run(ZSink.foreachWhile((n: Int) => ZIO.succeed(n <= 3)).exposeLeftover)
+            .run(ZSink.foreachWhile((n: Int) => ZIO.succeed(n <= 3)).collectLeftover)
             .map(_._2)
-          assertM(leftover)(equalTo(Chunk(4, 5)))
+          assertZIO(leftover)(equalTo(Chunk(4, 5)))
         }
       ),
-      suite("fromEffect")(
-        testM("handles leftovers (happy)") {
-          val s = ZSink.fromEffect[Any, Nothing, Int, String](ZIO.succeed("ok"))
-          assertM(ZStream(1, 2, 3).run(s.exposeLeftover))(
-            equalTo(("ok", Chunk(1, 2, 3)))
+      suite("fromZIO")(
+        test("result is ok") {
+          val s = ZSink.fromZIO(ZIO.succeed("ok"))
+          assertZIO(ZStream(1, 2, 3).run(s))(
+            equalTo("ok")
           )
         }
       ),
       suite("fromQueue")(
-        testM("enqueues all elements") {
-          checkM(pureStreamOfInts) { stream =>
-            for {
-              queue                    <- ZQueue.unbounded[Int]
-              (result, streamElements) <- stream.run(ZSink.fromQueue(queue) <&> ZSink.collectAll.map(_.toList))
-              queueElements            <- queue.takeAll
-            } yield assert(result)(isUnit) && assert(queueElements)(equalTo(streamElements))
-          }
-        },
-        testM("fails if offering to the queue fails") {
+        test("should enqueue all elements") {
+
           for {
-            queue       <- ZQueue.unbounded[Int]
-            exception    = new Exception
-            failingQueue = queue.contramapM[Any, Exception, Int](_ => ZIO.fail(exception))
-            queueSink    = ZSink.fromQueue(failingQueue)
-            stream       = Stream(1)
-            result      <- stream.run(queueSink).either
-          } yield assert(result)(isLeft(equalTo(exception)))
-        }
-      ),
-      suite("succeed")(
-        testM("handles leftovers") {
-          assertM(ZStream(1, 2, 3).run(ZSink.succeed[Int, String]("ok").exposeLeftover))(
-            equalTo(("ok", Chunk(1, 2, 3)))
-          )
+            queue          <- Queue.unbounded[Int]
+            _              <- ZStream(1, 2, 3).run(ZSink.fromQueue(queue))
+            enqueuedValues <- queue.takeAll
+          } yield {
+            assert(enqueuedValues)(hasSameElementsDistinct(List(1, 2, 3)))
+          }
+
         }
       ),
       suite("fromQueueWithShutdown")(
-        testM("enqueues all elements and shuts down the queue when the stream completes") {
-          checkM(Gen.listOfBounded(1, 5)(Gen.anyInt)) { elements =>
-            for {
-              sourceQueue         <- ZQueue.unbounded[Int]
-              targetQueue         <- ZQueue.unbounded[Int]
-              stream               = ZStream.fromQueue(sourceQueue)
-              streamCompleted     <- Promise.make[Nothing, Unit]
-              _                   <- stream.run(ZSink.fromQueueWithShutdown(targetQueue)).flatMap(streamCompleted.succeed).fork
-              _                   <- sourceQueue.offerAll(elements)
-              queueElements       <- targetQueue.takeBetween(elements.size, elements.size)
-              _                   <- sourceQueue.shutdown
-              _                   <- streamCompleted.await
-              targetQueueShutdown <- targetQueue.isShutdown
-            } yield assert(queueElements)(equalTo(elements)) &&
-              assert(targetQueueShutdown)(isTrue)
+        test("should enqueue all elements and shutsdown queue") {
+
+          def createQueueSpy[A](q: Queue[A]) = new Queue[A] {
+
+            @volatile
+            private var isShutDown = false
+
+            override def awaitShutdown(implicit trace: Trace): UIO[Unit] = q.awaitShutdown
+
+            override def capacity: Int = q.capacity
+
+            override def isShutdown(implicit trace: Trace): UIO[Boolean] = ZIO.succeed(this.isShutDown)
+
+            override def offer(a: A)(implicit trace: Trace): ZIO[Any, Nothing, Boolean] = q.offer(a)
+
+            override def offerAll[A1 <: A](as: Iterable[A1])(implicit trace: Trace): ZIO[Any, Nothing, Chunk[A1]] =
+              q.offerAll(as)
+
+            override def shutdown(implicit trace: Trace): UIO[Unit] = ZIO.succeed(this.isShutDown = true)
+
+            override def size(implicit trace: Trace): UIO[Int] = q.size
+
+            override def take(implicit trace: Trace): ZIO[Any, Nothing, A] = q.take
+
+            override def takeAll(implicit trace: Trace): ZIO[Any, Nothing, Chunk[A]] = q.takeAll
+
+            override def takeUpTo(max: Int)(implicit trace: Trace): ZIO[Any, Nothing, Chunk[A]] =
+              q.takeUpTo(max)
+
           }
-        },
-        testM("fails if offering to the queue fails") {
+
           for {
-            queue       <- ZQueue.unbounded[Int]
-            exception    = new Exception
-            failingQueue = queue.contramapM[Any, Exception, Int](_ => ZIO.fail(exception))
-            queueSink    = ZSink.fromQueueWithShutdown(failingQueue)
-            stream       = Stream(1)
-            result      <- stream.run(queueSink).either
-          } yield assert(result)(isLeft(equalTo(exception)))
-        },
-        testM("shuts down the queue if the stream fails") {
+            queue          <- Queue.unbounded[Int].map(createQueueSpy)
+            _              <- ZStream(1, 2, 3).run(ZSink.fromQueueWithShutdown(queue))
+            enqueuedValues <- queue.takeAll
+            isShutdown     <- queue.isShutdown
+          } yield {
+            assert(enqueuedValues)(hasSameElementsDistinct(List(1, 2, 3))) && assert(isShutdown)(isTrue)
+          }
+
+        }
+      ),
+      suite("fromHub")(
+        test("should publish all elements") {
+
           for {
-            queue      <- ZQueue.unbounded[Int]
-            exception   = new Exception
-            queueSink   = ZSink.fromQueueWithShutdown(queue)
-            stream      = Stream.fail(exception)
-            result     <- stream.run(queueSink).either
-            isShutdown <- queue.isShutdown
-          } yield assert(result)(isLeft(equalTo(exception))) &&
+            promise1 <- Promise.make[Nothing, Unit]
+            promise2 <- Promise.make[Nothing, Unit]
+            hub      <- Hub.unbounded[Int]
+            f <- ZIO.scoped {
+                   hub.subscribe.flatMap(s => promise1.succeed(()) *> promise2.await *> s.takeAll)
+                 }.fork
+            _              <- promise1.await
+            _              <- ZStream(1, 2, 3).run(ZSink.fromHub(hub))
+            _              <- promise2.succeed(())
+            publisedValues <- f.join
+          } yield {
+            assert(publisedValues)(hasSameElementsDistinct(List(1, 2, 3)))
+          }
+
+        }
+      ),
+      suite("fromHubWithShutdown")(
+        test("should shutdown hub") {
+          for {
+            hub        <- Hub.unbounded[Int]
+            _          <- ZStream(1, 2, 3).run(ZSink.fromHubWithShutdown(hub))
+            isShutdown <- hub.isShutdown
+          } yield {
             assert(isShutdown)(isTrue)
+          }
+
         }
-      )
-    ),
-    suite("Combinators")(
-      testM("raceBoth") {
-        checkM(Gen.listOf(Gen.int(0, 10)), Gen.boolean, Gen.boolean) { (ints, success1, success2) =>
-          val stream = ints ++ (if (success1) List(20) else Nil) ++ (if (success2) List(40) else Nil)
-          sinkRaceLaw(ZStream.fromIterable(Random.shuffle(stream)), findSink(20), findSink(40))
+      ),
+      suite("succeed")(
+        test("result is ok") {
+          assertZIO(ZStream(1, 2, 3).run(ZSink.succeed("ok")))(
+            equalTo("ok")
+          )
         }
-      },
-      suite("zipWithPar")(
-        testM("coherence") {
-          checkM(Gen.listOf(Gen.int(0, 10)), Gen.boolean, Gen.boolean) { (ints, success1, success2) =>
+      ),
+      suite("Combinators")(
+        test("raceBoth") {
+          check(Gen.listOf(Gen.int(0, 10)), Gen.boolean, Gen.boolean) { (ints, success1, success2) =>
             val stream = ints ++ (if (success1) List(20) else Nil) ++ (if (success2) List(40) else Nil)
-            SinkUtils
-              .zipParLaw(ZStream.fromIterable(Random.shuffle(stream)), findSink(20), findSink(40))
+            sinkRaceLaw(
+              ZStream.fromIterableZIO(Random.shuffle(stream)),
+              findSink(20),
+              findSink(40)
+            )
           }
         },
-        suite("zipRight (*>)")(
-          testM("happy path") {
-            assertM(ZStream(1, 2, 3).run(ZSink.head.zipParRight(ZSink.succeed[Int, String]("Hello"))))(
-              equalTo(("Hello"))
+        suite("zipWithPar")(
+          test("coherence") {
+            check(Gen.listOf(Gen.int(0, 10)), Gen.boolean, Gen.boolean) { (ints, success1, success2) =>
+              val stream = ints ++ (if (success1) List(20) else Nil) ++ (if (success2) List(40) else Nil)
+
+              zipParLaw(
+                ZStream.fromIterableZIO(Random.shuffle(stream)),
+                findSink(20),
+                findSink(40)
+              )
+            }
+          },
+          suite("zipRight (*>)")(
+            test("happy path") {
+              assertZIO(ZStream(1, 2, 3).run(ZSink.head.zipParRight(ZSink.succeed("Hello"))))(
+                equalTo(("Hello"))
+              )
+            }
+          ),
+          suite("zipWith")(test("happy path") {
+            assertZIO(ZStream(1, 2, 3).run(ZSink.head.zipParLeft(ZSink.succeed("Hello"))))(
+              equalTo(Some(1))
+            )
+          })
+        ),
+        suite("splitWhere")(
+          test("should split a stream on predicate and run each part into the sink") {
+            val in = ZStream(1, 2, 3, 4, 5, 6, 7, 8)
+            for {
+              res <- in.via(ZPipeline.fromSink(ZSink.collectAll[Int].splitWhere[Int](_ % 2 == 0))).runCollect
+            } yield {
+              assertTrue(res == Chunk(Chunk(1), Chunk(2, 3), Chunk(4, 5), Chunk(6, 7), Chunk(8)))
+            }
+          },
+          test("should split a stream on predicate and run each part into the sink, in several chunks") {
+            val in = ZStream.fromChunks(Chunk(1, 2, 3, 4), Chunk(5, 6, 7, 8))
+            for {
+              res <- in.via(ZPipeline.fromSink(ZSink.collectAll[Int].splitWhere[Int](_ % 2 == 0))).runCollect
+            } yield {
+              assertTrue(res == Chunk(Chunk(1), Chunk(2, 3), Chunk(4, 5), Chunk(6, 7), Chunk(8)))
+            }
+          },
+          test("not yield an empty sink if split on the first element") {
+            val in = ZStream(1, 2, 3, 4, 5, 6, 7, 8)
+            for {
+              res <- in.via(ZPipeline.fromSink(ZSink.collectAll[Int].splitWhere[Int](_ % 2 != 0))).runCollect
+            } yield {
+              assertTrue(res == Chunk(Chunk(1, 2), Chunk(3, 4), Chunk(5, 6), Chunk(7, 8)))
+            }
+          }
+        ),
+        test("findZIO with head sink") {
+          val sink: ZSink[Any, Nothing, Int, Int, Option[Option[Int]]] =
+            ZSink.head[Int].findZIO(h => ZIO.succeed(h.fold(false)(_ >= 10)))
+          val assertions = ZIO.foreach(Chunk(1, 3, 7, 20)) { n =>
+            assertZIO(ZStream.fromIterable(1 to 100).rechunk(n).run(sink))(equalTo(Some(Some(10))))
+          }
+          assertions.map(tst => tst.reduce(_ && _))
+        },
+        test("findZIO take sink across multiple chunks") {
+          val sink: ZSink[Any, Nothing, Int, Int, Option[Chunk[Int]]] =
+            ZSink.take[Int](4).findZIO(s => ZIO.succeed(s.sum > 10))
+
+          assertZIO(ZStream.fromIterable(1 to 8).rechunk(2).run(sink))(equalTo(Some(Chunk(5, 6, 7, 8))))
+        },
+        test("findZIO empty stream terminates with none") {
+          assertZIO(
+            ZStream.fromIterable(List.empty[Int]).run(ZSink.sum[Int].findZIO(s => ZIO.succeed(s > 0)))
+          )(equalTo(None))
+        },
+        test("findZIO unsatisfied condition terminates with none") {
+          assertZIO(
+            ZStream
+              .fromIterable(List(1, 2))
+              .run(ZSink.head[Int].findZIO(h => ZIO.succeed(h.fold(false)(_ >= 3))))
+          )(equalTo(None))
+        },
+        suite("flatMap")(
+          test("non-empty input") {
+            assertZIO(
+              ZStream(1, 2, 3)
+                .run(ZSink.head[Int].flatMap((x: Option[Int]) => ZSink.succeed(x)))
+            )(equalTo(Some(1)))
+          },
+          test("empty input") {
+            assertZIO(ZStream.empty.run(ZSink.head[Int].flatMap(h => ZSink.succeed(h))))(
+              equalTo(None)
+            )
+          },
+          test("with leftovers") {
+            val headAndCount =
+              ZSink.head[Int].flatMap((h: Option[Int]) => ZSink.count.map(cnt => (h, cnt)))
+            check(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.int)))) { chunks =>
+              ZStream.fromChunks(chunks: _*).run(headAndCount).map {
+                case (head, count) => {
+                  assert(head)(equalTo(chunks.flatten.headOption)) &&
+                  assert(count + head.toList.size)(equalTo(chunks.map(_.size.toLong).sum))
+                }
+              }
+            }
+          },
+          test("leftovers are kept in order") {
+            Ref.make(Chunk[Chunk[Int]]()).flatMap { readData =>
+              def takeN(n: Int) =
+                ZSink.take[Int](n).mapZIO(c => readData.update(_ :+ c))
+
+              def taker(data: Chunk[Chunk[Int]], n: Int): (Chunk[Int], Chunk[Chunk[Int]], Boolean) = {
+                import scala.collection.mutable
+                val buffer   = mutable.Buffer(data: _*)
+                val builder  = mutable.Buffer[Int]()
+                var wasSplit = false
+
+                while (builder.size < n && buffer.nonEmpty) {
+                  val popped = buffer.remove(0)
+
+                  if ((builder.size + popped.size) <= n) builder ++= popped
+                  else {
+                    val splitIndex  = n - builder.size
+                    val (take, ret) = popped.splitAt(splitIndex)
+                    builder ++= take
+                    buffer.prepend(ret)
+
+                    if (splitIndex > 0)
+                      wasSplit = true
+                  }
+                }
+
+                (Chunk.fromIterable(builder), Chunk.fromIterable(buffer), wasSplit)
+              }
+
+              val gen =
+                for {
+                  sequenceSize <- Gen.int(1, 50)
+                  takers       <- Gen.int(1, 5)
+                  takeSizes    <- Gen.listOfN(takers)(Gen.int(1, sequenceSize))
+                  inputs       <- Gen.chunkOfN(sequenceSize)(ZStreamGen.tinyChunkOf(Gen.int))
+                  (expectedTakes, leftoverInputs, wasSplit) = takeSizes.foldLeft((Chunk[Chunk[Int]](), inputs, false)) {
+                                                                case ((takenChunks, leftover, _), takeSize) =>
+                                                                  val (taken, rest, wasSplit) =
+                                                                    taker(leftover, takeSize)
+                                                                  (takenChunks :+ taken, rest, wasSplit)
+                                                              }
+                  expectedLeftovers = if (wasSplit) leftoverInputs.head
+                                      else Chunk()
+                } yield (inputs, takeSizes, expectedTakes, expectedLeftovers)
+
+              check(gen) { case (inputs, takeSizes, expectedTakes, expectedLeftovers) =>
+                val takingSinks = takeSizes.map(takeN(_)).reduce(_ *> _).channel.collectElements
+                val channel     = ZChannel.writeAll(inputs: _*) >>> takingSinks
+
+                (channel.run <*> readData.getAndSet(Chunk())).map { case (leftovers, _, takenChunks) =>
+                  assert(leftovers.flatten)(equalTo(expectedLeftovers)) &&
+                    assert(takenChunks)(equalTo(expectedTakes))
+                }
+              }
+            }
+          } @@ jvmOnly
+        ),
+        suite("repeat")(
+          test("runs until the source is exhausted") {
+            assertZIO(
+              ZStream
+                .fromChunks(Chunk(1, 2), Chunk(3, 4, 5), Chunk(), Chunk(6, 7), Chunk(8, 9))
+                .run(ZSink.take[Int](3).collectAll)
+            )(
+              equalTo(Chunk(Chunk(1, 2, 3), Chunk(4, 5, 6), Chunk(7, 8, 9), Chunk.empty))
+            )
+          },
+          test("combinators") {
+            assertZIO(
+              ZStream
+                .fromChunks(Chunk(1, 2), Chunk(3, 4, 5), Chunk.empty, Chunk(6, 7), Chunk(8, 9))
+                .run(ZSink.sum[Int].collectAll.map(_.sum))
+            )(
+              equalTo(45)
+            )
+          },
+          test("handles errors") {
+            assertZIO(
+              (ZStream
+                .fromChunks(Chunk(1, 2)))
+                .run(ZSink.fail(()).collectAll)
+                .either
+            )(
+              isLeft
             )
           }
         ),
-        suite("zipWith")(testM("happy path") {
-          assertM(ZStream(1, 2, 3).run(ZSink.head.zipParLeft(ZSink.succeed[Int, String]("Hello"))))(
-            equalTo(Some(1))
-          )
-        })
-      ),
-      testM("untilOutputM") {
-        val sink: ZSink[Any, Nothing, Int, Int, Option[Option[Int]]] =
-          ZSink.head[Int].untilOutputM(h => ZIO.succeed(h.fold(false)(_ >= 10)))
-        val assertions = ZIO.foreach(Chunk(1, 3, 7, 20)) { n =>
-          assertM(Stream.fromIterable(1 to 100).chunkN(n).run(sink))(equalTo(Some(Some(10))))
-        }
-        assertions.map(tst => tst.reduce(_ && _))
-      },
-      suite("flatMap")(
-        testM("non-empty input") {
-          assertM(
-            ZStream(1, 2, 3).run(ZSink.head[Int].flatMap((x: Option[Int]) => ZSink.succeed[Int, Option[Int]](x)))
-          )(equalTo(Some(1)))
-        },
-        testM("empty input") {
-          assertM(ZStream.empty.run(ZSink.head[Int].flatMap(h => ZSink.succeed[Int, Option[Int]](h))))(
-            equalTo(None)
-          )
-        },
-        testM("with leftovers") {
-          val headAndCount: ZSink[Any, Nothing, Int, Int, (Option[Int], Long)] =
-            ZSink.head[Int].flatMap(h => ZSink.count.map(cnt => (h, cnt)))
-          checkM(Gen.listOf(Gen.small(Gen.chunkOfN(_)(Gen.anyInt)))) { chunks =>
-            ZStream.fromChunks(chunks: _*).run(headAndCount).map {
-              case (head, count) => {
-                assert(head)(equalTo(chunks.flatten.headOption)) &&
-                assert(count + head.toList.size)(equalTo(chunks.map(_.size.toLong).sum))
+        suite("take")(
+          test("take")(
+            check(Gen.chunkOf(Gen.small(Gen.chunkOfN(_)(Gen.int))), Gen.int) { (chunks, n) =>
+              ZIO.scoped {
+                ZStream
+                  .fromChunks(chunks: _*)
+                  .peel(ZSink.take[Int](n))
+                  .flatMap { case (chunk, stream) =>
+                    stream.runCollect.map { leftover =>
+                      assert(chunk)(equalTo(chunks.flatten.take(n))) &&
+                      assert(leftover)(equalTo(chunks.flatten.drop(n)))
+                    }
+                  }
               }
             }
-          }
+          )
+        ),
+        test("timed") {
+          for {
+            f <- ZStream.fromIterable(1 to 10).mapZIO(i => Clock.sleep(10.millis).as(i)).run(ZSink.timed).fork
+            _ <- TestClock.adjust(100.millis)
+            r <- f.join
+          } yield assert(r)(isGreaterThanEqualTo(100.millis))
         }
-      ),
-      testM("take")(
-        checkM(Gen.chunkOf(Gen.small(Gen.chunkOfN(_)(Gen.anyInt))), Gen.anyInt) { (chunks, n) =>
-          ZStream
-            .fromChunks(chunks: _*)
-            .peel(ZSink.take[Int](n))
-            .flatMap { case (chunk, stream) =>
-              stream.runCollect.toManaged_.map { leftover =>
-                assert(chunk)(equalTo(chunks.flatten.take(n))) &&
-                assert(leftover)(equalTo(chunks.flatten.drop(n)))
-              }
-            }
-            .useNow
-        }
-      ),
-      testM("take emits at end of chunk")(
-        Stream(1, 2)
-          .concat(Stream.dieMessage("should not get this far"))
-          .run(Sink.take(2))
-          .map(assert(_)(equalTo(Chunk(1, 2))))
-      ),
-      testM("timed") {
-        for {
-          f <- ZStream.fromIterable(1 to 10).mapM(i => clock.sleep(10.millis).as(i)).run(ZSink.timed).fork
-          _ <- TestClock.adjust(100.millis)
-          r <- f.join
-        } yield assert(r)(isGreaterThanEqualTo(100.millis))
-      }
+      )
     )
-  )
+  }
 }

@@ -16,16 +16,12 @@
 
 package zio
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 package object stream {
   type Stream[+E, +A] = ZStream[Any, E, A]
-  val Stream = ZStream
 
   type UStream[+A] = ZStream[Any, Nothing, A]
-  val UStream = ZStream
 
-  type Sink[+E, A, +L, +B] = ZSink[Any, E, A, L, B]
-  val Sink = ZSink
-
-  type Transducer[+E, -A, +B] = ZTransducer[Any, E, A, B]
-  val Transducer = ZTransducer
+  type Sink[+OutErr, -In, +L, +Z] = ZSink[Any, OutErr, In, L, Z]
 }

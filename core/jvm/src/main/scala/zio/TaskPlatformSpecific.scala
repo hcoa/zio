@@ -17,21 +17,24 @@
 package zio
 
 import zio.interop.javaz
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.nio.channels.CompletionHandler
 import java.util.concurrent.{CompletableFuture, CompletionStage}
 
 private[zio] trait TaskPlatformSpecific {
 
-  def effectAsyncWithCompletionHandler[T](op: CompletionHandler[T, Any] => Any): Task[T] =
-    javaz.effectAsyncWithCompletionHandler(op)
+  def asyncWithCompletionHandler[T](op: CompletionHandler[T, Any] => Any)(implicit trace: Trace): Task[T] =
+    javaz.asyncWithCompletionHandler(op)
 
   /**
    * Alias for `formCompletionStage` for a concrete implementation of
    * CompletionStage
    */
-  def fromCompletableFuture[A](cs: => CompletableFuture[A]): Task[A] = fromCompletionStage(cs)
+  def fromCompletableFuture[A](cs: => CompletableFuture[A])(implicit trace: Trace): Task[A] =
+    fromCompletionStage(cs)
 
-  def fromCompletionStage[A](cs: => CompletionStage[A]): Task[A] = javaz.fromCompletionStage(cs)
+  def fromCompletionStage[A](cs: => CompletionStage[A])(implicit trace: Trace): Task[A] =
+    javaz.fromCompletionStage(cs)
 
 }

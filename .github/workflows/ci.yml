@@ -1,13 +1,14 @@
 name: CI
 
 env:
-  JDK_JAVA_OPTIONS: -XX:+PrintCommandLineFlags -Xmx3G # JDK_JAVA_OPTIONS is _the_ env. variable to use for modern Java
-  JVM_OPTS: -XX:+PrintCommandLineFlags -Xmx3G # for Java 8 only (sadly, it is not modern enough for JDK_JAVA_OPTIONS)
+  JDK_JAVA_OPTIONS: -XX:+PrintCommandLineFlags -XX:+UseG1GC -Xmx6g -Xms6g # JDK_JAVA_OPTIONS is _the_ env. variable to use for modern Java
+  JVM_OPTS: -XX:+PrintCommandLineFlags -XX:+UseG1GC -Xmx6g -Xms6g # for Java 8 only (sadly, it is not modern enough for JDK_JAVA_OPTIONS)
 
 on:
   pull_request:
   push:
-    branches: ['master']
+    branches:
+      - 'series/2.x'
   release:
     types:
       - published
@@ -18,7 +19,7 @@ jobs:
     timeout-minutes: 60
     steps:
     - name: Checkout current branch
-      uses: actions/checkout@v3.0.0
+      uses: actions/checkout@v3.0.2
     - name: Setup Java
       uses: actions/setup-java@v2.5.0
       with:
@@ -35,7 +36,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
       - name: Setup Java
         uses: actions/setup-java@v2.5.0
         with:
@@ -52,7 +53,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
       - name: Setup Java
         uses: actions/setup-java@v2.5.0
         with:
@@ -69,7 +70,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
       - name: Setup Java
         uses: actions/setup-java@v2.5.0
         with:
@@ -79,7 +80,8 @@ jobs:
       - name: Cache scala dependencies
         uses: coursier/cache-action@v6
       - name: Check Website Generation
-        run: ./sbt docs/docusaurusCreateSite
+        run: |
+          ./scripts/checkSite.sh
         
   test:
     runs-on: ubuntu-20.04
@@ -87,11 +89,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scala: ['2.11.12', '2.12.15', '2.13.8', '3.1.1']
+        scala: ['2.11.12', '2.12.15', '2.13.8', '3.1.2']
         platform: ['JVM']
     steps:
     - name: Checkout current branch
-      uses: actions/checkout@v3.0.0
+      uses: actions/checkout@v3.0.2
     - name: Setup Java
       uses: actions/setup-java@v2.5.0
       with:
@@ -123,7 +125,7 @@ jobs:
         platform: ['JVM']
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
       - name: Setup Java
         uses: actions/setup-java@v2.5.0
         with:
@@ -142,9 +144,12 @@ jobs:
       fail-fast: false
       matrix:
         platform: ['JS', 'Native']
+    env:
+      JVM_OPTS: -XX:+PrintCommandLineFlags -XX:+UseG1GC -Xmx6g -Xms6g
+      NODE_OPTIONS: --max_old_space_size=6144
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
       - name: Setup Java
         uses: actions/setup-java@v2.5.0
         with:
@@ -170,7 +175,7 @@ jobs:
     if: github.event_name != 'pull_request'
     steps:
       - name: Checkout current branch
-        uses: actions/checkout@v3.0.0
+        uses: actions/checkout@v3.0.2
         with:
           fetch-depth: 0
       - name: Setup Java

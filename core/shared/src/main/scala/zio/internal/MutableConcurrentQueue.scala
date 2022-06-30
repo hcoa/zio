@@ -17,8 +17,9 @@
 package zio.internal
 
 import zio.{Chunk, ChunkBuilder}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
-object MutableConcurrentQueue {
+private[zio] object MutableConcurrentQueue {
 
   /**
    * @note
@@ -45,7 +46,7 @@ object MutableConcurrentQueue {
  *   this is declared as `abstract class` since `invokevirtual` is slightly
  *   cheaper than `invokeinterface`.
  */
-protected[zio] abstract class MutableConcurrentQueue[A] {
+private[zio] abstract class MutableConcurrentQueue[A] {
 
   /**
    * The '''maximum''' number of elements that a queue can hold.
@@ -67,9 +68,8 @@ protected[zio] abstract class MutableConcurrentQueue[A] {
   /**
    * A non-blocking enqueue of multiple elements.
    */
-  def offerAll(as: Iterable[A]): Chunk[A] = {
-    val builder = ChunkBuilder.make[A]()
-    builder.sizeHint(as.size)
+  def offerAll[A1 <: A](as: Iterable[A1]): Chunk[A1] = {
+    val builder  = ChunkBuilder.make[A1]()
     val iterator = as.iterator
     var loop     = true
     while (loop && iterator.hasNext) {
@@ -92,7 +92,7 @@ protected[zio] abstract class MutableConcurrentQueue[A] {
    * @note
    *   that if there's no meaningful default for your type, you can always use
    *   `poll(null)`. Not the best, but reasonable price to pay for lower heap
-   *   churn from not using [[scala.Option]] here.
+   *   churn from not using `Option` here.
    */
   def poll(default: A): A
 
@@ -127,8 +127,8 @@ protected[zio] abstract class MutableConcurrentQueue[A] {
    *   the number of elements that have ever been added to the queue.
    *
    * @note
-   *   that [[scala.Long]] is used here, since [[scala.Int]] will be overflowed
-   *   really quickly for busy queues.
+   *   that `Long` is used here, since `Int` will be overflowed really quickly
+   *   for busy queues.
    *
    * @note
    *   if you know how much time the queue is alive, you can calculate the rate

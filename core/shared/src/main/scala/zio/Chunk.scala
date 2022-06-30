@@ -20,6 +20,7 @@ import java.nio._
 import java.util.concurrent.atomic.AtomicInteger
 import scala.annotation.tailrec
 import scala.collection.mutable.Builder
+import scala.math.log
 import scala.reflect.{ClassTag, classTag}
 
 /**
@@ -37,14 +38,8 @@ import scala.reflect.{ClassTag, classTag}
  * result, it is not safe to construct chunks from heterogeneous primitive
  * types.
  */
-sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
-
-  /**
-   * Appends an element to the chunk
-   */
-  @deprecated("use :+", "1.0.0")
-  final def +[A1 >: A](a: A1): Chunk[A1] =
-    self :+ a
+sealed abstract class Chunk[+A] extends ChunkLike[A] with Serializable { self =>
+  def chunkIterator: Chunk.ChunkIterator[A]
 
   /**
    * Returns the concatenation of this chunk with the specified chunk.
@@ -57,6 +52,8 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
       case (self, Chunk.PrependN(end, buffer, bufferUsed, _)) =>
         val chunk = Chunk.fromArray(buffer.asInstanceOf[Array[A1]]).takeRight(bufferUsed)
         self ++ chunk ++ end
+      case (self, Chunk.Empty) => self
+      case (Chunk.Empty, that) => that
       case (self, that) =>
         val diff = that.depth - self.depth
         if (math.abs(diff) <= 1) Chunk.Concat(self, that)
@@ -91,14 +88,86 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
         }
     }
 
+  /**
+   * Returns the concatenation of this chunk with the specified chunk.
+   */
   final def ++[A1 >: A](that: NonEmptyChunk[A1]): NonEmptyChunk[A1] =
     that.prepend(self)
 
   /**
+   * Returns the bitwise AND of this chunk and the specified chunk.
+   */
+  def &(that: Chunk[Boolean])(implicit ev: A <:< Boolean): Chunk.BitChunkByte =
+    Chunk.bitwise(self.asInstanceOf[Chunk[Boolean]], that, _ & _)
+
+  /**
+   * Returns the bitwise OR of this chunk and the specified chunk.
+   */
+  def |(that: Chunk[Boolean])(implicit ev: A <:< Boolean): Chunk.BitChunkByte =
+    Chunk.bitwise(self.asInstanceOf[Chunk[Boolean]], that, _ | _)
+
+  /**
+   * Returns the bitwise XOR of this chunk and the specified chunk.
+   */
+  def ^(that: Chunk[Boolean])(implicit ev: A <:< Boolean): Chunk.BitChunkByte =
+    Chunk.bitwise(self.asInstanceOf[Chunk[Boolean]], that, _ ^ _)
+
+  /**
+   * Returns the bitwise NOT of this chunk.
+   */
+  def negate(implicit ev: A <:< Boolean): Chunk.BitChunkByte = {
+    val bits      = self.length
+    val fullBytes = bits >> 3
+    val remBytes  = bits & 7
+    val arr       = Array.ofDim[Byte](fullBytes + (if (remBytes == 0) 0 else 1))
+    var i         = 0
+    var mask      = 128
+    while (i < fullBytes) {
+      var byte = 0
+      mask = 128
+      (0 until 8).foreach { k =>
+        byte = byte | (if (!ev(self(i * 8 + k))) mask else 0)
+        mask >>= 1
+      }
+      arr(i) = byte.asInstanceOf[Byte]
+      i += 1
+    }
+    if (remBytes != 0) {
+      var byte = 0
+      mask = 128
+      (0 until remBytes).foreach { k =>
+        byte = byte | (if (!ev(self(fullBytes * 8 + k))) mask else 0)
+        mask >>= 1
+      }
+      arr(fullBytes) = byte.asInstanceOf[Byte]
+    }
+    Chunk.BitChunkByte(Chunk.fromArray(arr), 0, bits)
+  }
+
+  /**
+   * Converts a chunk of ints to a chunk of bits.
+   */
+  final def asBitsInt(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Int): Chunk[Boolean] =
+    Chunk.BitChunkInt(self.asInstanceOf[Chunk[Int]], endianness, 0, length << 5)
+
+  /**
+   * Converts a chunk of longs to a chunk of bits.
+   */
+  final def asBitsLong(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Long): Chunk[Boolean] =
+    Chunk.BitChunkLong(self.asInstanceOf[Chunk[Long]], endianness, 0, length << 6)
+
+  /**
    * Converts a chunk of bytes to a chunk of bits.
    */
-  final def asBits(implicit ev: A <:< Byte): Chunk[Boolean] =
-    Chunk.BitChunk(self.map(ev), 0, length << 3)
+  final def asBitsByte(implicit ev: A <:< Byte): Chunk[Boolean] =
+    Chunk.BitChunkByte(self.map(ev), 0, length << 3)
+
+  def toPackedByte(implicit ev: A <:< Boolean): Chunk[Byte] =
+    Chunk.ChunkPackedBoolean[Byte](self.asInstanceOf[Chunk[Boolean]], 8, Chunk.BitChunk.Endianness.BigEndian)
+  def toPackedInt(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Boolean): Chunk[Int] =
+    Chunk.ChunkPackedBoolean[Int](self.asInstanceOf[Chunk[Boolean]], 32, endianness)
+  def toPackedLong(endianness: Chunk.BitChunk.Endianness)(implicit ev: A <:< Boolean): Chunk[Long] =
+    Chunk.ChunkPackedBoolean[Long](self.asInstanceOf[Chunk[Boolean]], 64, endianness)
 
   /**
    * Get the element at the specified index.
@@ -119,21 +188,23 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     ev(apply(index))
 
   /**
-   * Returns a filtered, mapped subset of the elements of this chunk based on a
-   * .
-   */
-  def collectM[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]]): ZIO[R, E, Chunk[B]] =
-    if (isEmpty) ZIO.succeedNow(Chunk.empty) else self.materialize.collectM(pf)
-
-  /**
    * Transforms all elements of the chunk for as long as the specified partial
    * function is defined.
    */
   def collectWhile[B](pf: PartialFunction[A, B]): Chunk[B] =
     if (isEmpty) Chunk.empty else self.materialize.collectWhile(pf)
 
-  def collectWhileM[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]]): ZIO[R, E, Chunk[B]] =
-    if (isEmpty) ZIO.succeedNow(Chunk.empty) else self.materialize.collectWhileM(pf)
+  def collectWhileZIO[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]])(implicit
+    trace: Trace
+  ): ZIO[R, E, Chunk[B]] =
+    if (isEmpty) ZIO.succeedNow(Chunk.empty) else self.materialize.collectWhileZIO(pf)
+
+  /**
+   * Returns a filtered, mapped subset of the elements of this chunk based on a
+   * .
+   */
+  def collectZIO[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]])(implicit trace: Trace): ZIO[R, E, Chunk[B]] =
+    if (isEmpty) ZIO.succeedNow(Chunk.empty) else self.materialize.collectZIO(pf)
 
   /**
    * Determines whether this chunk and the specified chunk have the same length
@@ -143,41 +214,35 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
   final def corresponds[B](that: Chunk[B])(f: (A, B) => Boolean): Boolean =
     if (self.length != that.length) false
     else {
-      val leftIterator    = self.arrayIterator
-      val rightIterator   = that.arrayIterator
-      var left: Array[A]  = null
-      var right: Array[B] = null
-      var leftLength      = 0
-      var rightLength     = 0
-      var i               = 0
-      var j               = 0
-      var equal           = true
-      var done            = false
-      while (equal && !done) {
-        if (i < leftLength && j < rightLength) {
-          val a = left(i)
-          val b = right(j)
-          if (!f(a, b)) {
-            equal = false
-          }
-          i += 1
-          j += 1
-        } else if (i == leftLength && leftIterator.hasNext) {
-          left = leftIterator.next()
-          leftLength = left.length
-          i = 0
-        } else if (j == rightLength && rightIterator.hasNext) {
-          right = rightIterator.next()
-          rightLength = right.length
-          j = 0
-        } else if (i == leftLength && j == rightLength) {
-          done = true
-        } else {
-          equal = false
-        }
+      val leftIterator  = self.chunkIterator
+      val rightIterator = that.chunkIterator
+      var index         = 0
+      var equal         = true
+      while (equal && leftIterator.hasNextAt(index) && rightIterator.hasNextAt(index)) {
+        val a = leftIterator.nextAt(index)
+        val b = rightIterator.nextAt(index)
+        index += 1
+        equal = f(a, b)
       }
       equal
     }
+
+  /**
+   * Deduplicates adjacent elements that are identical.
+   */
+  def dedupe: Chunk[A] = {
+    val builder = ChunkBuilder.make[A]()
+
+    var lastA = null.asInstanceOf[A]
+
+    foreach { a =>
+      if (a != lastA) builder += a
+
+      lastA = a
+    }
+
+    builder.result()
+  }
 
   /**
    * Get the element at the specified index.
@@ -196,7 +261,10 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     else
       self match {
         case Chunk.Slice(c, o, l) => Chunk.Slice(c, o + n, l - n)
-        case _                    => Chunk.Slice(self, n, len - n)
+        case Chunk.Concat(l, r) =>
+          if (n > l.length) r.drop(n - l.length)
+          else Chunk.Concat(l.drop(n), r)
+        case _ => Chunk.Slice(self, n, len - n)
       }
   }
 
@@ -211,49 +279,87 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     else
       self match {
         case Chunk.Slice(c, o, l) => Chunk.Slice(c, o, l - n)
-        case _                    => Chunk.Slice(self, 0, len - n)
+        case Chunk.Concat(l, r) =>
+          if (n > r.length) l.dropRight(n - r.length)
+          else Chunk.Concat(l, r.dropRight(n))
+        case _ => Chunk.Slice(self, 0, len - n)
       }
   }
+
+  /**
+   * Drops all elements until the predicate returns true.
+   */
+  def dropUntil(f: A => Boolean): Chunk[A] = {
+    val iterator = self.chunkIterator
+    var continue = true
+    var i        = 0
+    while (continue && iterator.hasNextAt(i)) {
+      val a = iterator.nextAt(i)
+      if (f(a)) continue = false
+      i += 1
+    }
+    drop(i)
+  }
+
+  /**
+   * Drops all elements until the effectful predicate returns true.
+   */
+  def dropUntilZIO[R, E](p: A => ZIO[R, E, Boolean])(implicit trace: Trace): ZIO[R, E, Chunk[A]] =
+    ZIO.suspendSucceed {
+      val builder = ChunkBuilder.make[A]()
+      builder.sizeHint(self.length)
+      var dropping: ZIO[R, E, Boolean] = ZIO.succeedNow(false)
+      val iterator                     = self.chunkIterator
+      var index                        = 0
+      while (iterator.hasNextAt(index)) {
+        val a = iterator.nextAt(index)
+        index += 1
+        dropping = dropping.flatMap {
+          case true =>
+            builder += a
+            ZIO.succeed(true)
+
+          case false =>
+            p(a)
+        }
+      }
+      dropping as builder.result()
+    }
 
   /**
    * Drops all elements so long as the predicate returns true.
    */
   override def dropWhile(f: A => Boolean): Chunk[A] = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
     var continue = true
     var i        = 0
-    while (continue && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var j      = 0
-      while (continue && j < length) {
-        val a = array(j)
-        if (f(a)) {
-          i += 1
-          j += 1
-        } else {
-          continue = false
-        }
+    while (continue && iterator.hasNextAt(i)) {
+      val a = iterator.nextAt(i)
+      if (f(a)) {
+        i += 1
+      } else {
+        continue = false
       }
     }
     drop(i)
   }
 
-  def dropWhileM[R, E](p: A => ZIO[R, E, Boolean]): ZIO[R, E, Chunk[A]] = ZIO.effectSuspendTotal {
-    val length  = self.length
-    val builder = ChunkBuilder.make[A]()
-    builder.sizeHint(length)
-    var dropping: ZIO[R, E, Boolean] = UIO.succeedNow(true)
-    val iterator                     = arrayIterator
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val j = i
+  /**
+   * Drops all elements so long as the effectful predicate returns true.
+   */
+  def dropWhileZIO[R, E](p: A => ZIO[R, E, Boolean])(implicit trace: Trace): ZIO[R, E, Chunk[A]] =
+    ZIO.suspendSucceed {
+      val length  = self.length
+      val builder = ChunkBuilder.make[A]()
+      builder.sizeHint(length)
+      var dropping: ZIO[R, E, Boolean] = ZIO.succeedNow(true)
+      val iterator                     = self.chunkIterator
+      var index                        = 0
+      while (iterator.hasNextAt(index)) {
+        val a = iterator.nextAt(index)
+        index += 1
         dropping = dropping.flatMap { d =>
-          val a = array(j)
-          (if (d) p(a) else UIO(false)).map {
+          (if (d) p(a) else ZIO.succeed(false)).map {
             case true =>
               true
             case false =>
@@ -261,55 +367,14 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
               false
           }
         }
-        i += 1
       }
+      dropping as builder.result()
     }
-    dropping as builder.result()
-  }
 
   override final def equals(that: Any): Boolean =
     that match {
-      case that: Chunk[_] =>
-        if (self.length != that.length) false
-        else {
-          val leftIterator    = self.arrayIterator
-          val rightIterator   = that.arrayIterator
-          var left: Array[A]  = null
-          var right: Array[_] = null
-          var leftLength      = 0
-          var rightLength     = 0
-          var i               = 0
-          var j               = 0
-          var equal           = true
-          var done            = false
-          while (equal && !done) {
-            if (i < leftLength && j < rightLength) {
-              val a1 = left(i)
-              val a2 = right(j)
-              if (a1 != a2) {
-                equal = false
-              }
-              i += 1
-              j += 1
-            } else if (i == leftLength && leftIterator.hasNext) {
-              left = leftIterator.next()
-              leftLength = left.length
-              i = 0
-            } else if (j == rightLength && rightIterator.hasNext) {
-              right = rightIterator.next()
-              rightLength = right.length
-              j = 0
-            } else if (i == leftLength && j == rightLength) {
-              done = true
-            } else {
-              equal = false
-            }
-          }
-          equal
-        }
-      case that: Seq[_] =>
-        self.corresponds(that)(_ == _)
-      case _ => false
+      case that: Seq[_] => self.corresponds(that)(_ == _)
+      case _            => false
     }
 
   /**
@@ -317,17 +382,13 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * this chunk.
    */
   override final def exists(f: A => Boolean): Boolean = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     var exists   = false
-    while (!exists && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (!exists && i < length) {
-        val a = array(i)
-        exists = f(a)
-        i += 1
-      }
+    while (!exists && iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      exists = f(a)
     }
     exists
   }
@@ -336,19 +397,15 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Returns a filtered subset of this chunk.
    */
   override def filter(f: A => Boolean): Chunk[A] = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     val builder  = ChunkBuilder.make[A]()
     builder.sizeHint(length)
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
-        if (f(a)) {
-          builder += a
-        }
-        i += 1
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      if (f(a)) {
+        builder += a
       }
     }
     builder.result()
@@ -358,52 +415,63 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Filters this chunk by the specified effectful predicate, retaining all
    * elements for which the predicate evaluates to true.
    */
-  final def filterM[R, E](f: A => ZIO[R, E, Boolean]): ZIO[R, E, Chunk[A]] = ZIO.effectSuspendTotal {
-    val iterator = arrayIterator
-    val builder  = ChunkBuilder.make[A]()
-    builder.sizeHint(length)
-    var dest: ZIO[R, E, ChunkBuilder[A]] = IO.succeedNow(builder)
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
+  final def filterZIO[R, E](f: A => ZIO[R, E, Boolean])(implicit trace: Trace): ZIO[R, E, Chunk[A]] =
+    ZIO.suspendSucceed {
+      val iterator = self.chunkIterator
+      var index    = 0
+      val builder  = ChunkBuilder.make[A]()
+      builder.sizeHint(length)
+      var dest: ZIO[R, E, ChunkBuilder[A]] = ZIO.succeedNow(builder)
+      while (iterator.hasNextAt(index)) {
+        val a = iterator.nextAt(index)
+        index += 1
         dest = dest.zipWith(f(a)) { case (builder, res) =>
           if (res) builder += a else builder
         }
-        i += 1
       }
+      dest.map(_.result())
     }
-    dest.map(_.result())
-  }
 
   /**
    * Returns the first element that satisfies the predicate.
    */
   override final def find(f: A => Boolean): Option[A] = {
-    val iterator          = arrayIterator
+    val iterator          = self.chunkIterator
+    var index             = 0
     var result: Option[A] = None
-    while (result.isEmpty && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (result.isEmpty && i < length) {
-        val a = array(i)
-        if (f(a)) {
-          result = Some(a)
-        }
-        i += 1
+    while (result.isEmpty && iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      if (f(a)) {
+        result = Some(a)
       }
     }
     result
   }
 
   /**
-   * Flattens a chunk of chunks into a single chunk by concatenating all chunks.
+   * Returns the first element that satisfies the effectful predicate.
    */
-  final def flatten[B](implicit ev: A <:< Chunk[B]): Chunk[B] =
-    flatMap(ev(_))
+  final def findZIO[R, E](f: A => ZIO[R, E, Boolean])(implicit trace: Trace): ZIO[R, E, Option[A]] =
+    ZIO.suspendSucceed {
+      val iterator = self.chunkIterator
+      var index    = 0
+
+      def loop(iterator: Chunk.ChunkIterator[A]): ZIO[R, E, Option[A]] =
+        if (iterator.hasNextAt(index)) {
+          val a = iterator.nextAt(index)
+          index += 1
+
+          f(a).flatMap {
+            if (_) ZIO.succeedNow(Some(a))
+            else loop(iterator)
+          }
+        } else {
+          ZIO.succeedNow(None)
+        }
+
+      loop(iterator)
+    }
 
   /**
    * Get the element at the specified index.
@@ -415,17 +483,13 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Folds over the elements in this chunk from the left.
    */
   override def foldLeft[S](s0: S)(f: (S, A) => S): S = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     var s        = s0
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
-        s = f(s, a)
-        i += 1
-      }
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      s = f(s, a)
     }
     s
   }
@@ -433,24 +497,18 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
   /**
    * Effectfully folds over the elements in this chunk from the left.
    */
-  final def foldM[R, E, S](s: S)(f: (S, A) => ZIO[R, E, S]): ZIO[R, E, S] =
-    foldLeft[ZIO[R, E, S]](IO.succeedNow(s))((s, a) => s.flatMap(f(_, a)))
+  final def foldZIO[R, E, S](s: S)(f: (S, A) => ZIO[R, E, S])(implicit trace: Trace): ZIO[R, E, S] =
+    foldLeft[ZIO[R, E, S]](ZIO.succeedNow(s))((s, a) => s.flatMap(f(_, a)))
 
   /**
    * Folds over the elements in this chunk from the right.
    */
   override def foldRight[S](s0: S)(f: (A, S) => S): S = {
-    val iterator = reverseArrayIterator
+    val iterator = self.reverseIterator
     var s        = s0
     while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = length - 1
-      while (i >= 0) {
-        val a = array(i)
-        s = f(a, s)
-        i -= 1
-      }
+      val a = iterator.next()
+      s = f(a, s)
     }
     s
   }
@@ -460,62 +518,46 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * when the condition is not fulfilled.
    */
   final def foldWhile[S](s0: S)(pred: S => Boolean)(f: (S, A) => S): S = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     var s        = s0
     var continue = pred(s)
-    while (continue && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (continue && i < length) {
-        val a = array(i)
-        s = f(s, a)
-        continue = pred(s)
-        i += 1
-      }
+    while (continue && iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      s = f(s, a)
+      continue = pred(s)
     }
     s
   }
 
-  final def foldWhileM[R, E, S](z: S)(pred: S => Boolean)(f: (S, A) => ZIO[R, E, S]): ZIO[R, E, S] = {
-    val iterator = arrayIterator
+  final def foldWhileZIO[R, E, S](
+    z: S
+  )(pred: S => Boolean)(f: (S, A) => ZIO[R, E, S])(implicit trace: Trace): ZIO[R, E, S] = {
+    val iterator = self.chunkIterator
 
-    def loop(s: S, iterator: Iterator[Array[A]], array: Array[A], i: Int, length: Int): ZIO[R, E, S] =
-      if (i < length) {
-        if (pred(s)) f(s, array(i)).flatMap(loop(_, iterator, array, i + 1, length))
-        else IO.succeedNow(s)
-      } else if (iterator.hasNext) {
-        val array  = iterator.next()
-        val length = array.length
-        loop(s, iterator, array, 0, length)
+    def loop(s: S, iterator: Chunk.ChunkIterator[A], index: Int): ZIO[R, E, S] =
+      if (iterator.hasNextAt(index)) {
+        if (pred(s)) f(s, iterator.nextAt(index)).flatMap(loop(_, iterator, index + 1))
+        else ZIO.succeedNow(s)
       } else {
         ZIO.succeedNow(s)
       }
 
-    if (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      loop(z, iterator, array, 0, length)
-    } else {
-      ZIO.succeedNow(z)
-    }
+    loop(z, iterator, 0)
   }
 
   /**
    * Determines whether a predicate is satisfied for all elements of this chunk.
    */
   override final def forall(f: A => Boolean): Boolean = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     var exists   = true
-    while (exists && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (exists && i < length) {
-        val a = array(i)
-        exists = f(a)
-        i += 1
-      }
+    while (exists && iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      exists = f(a)
     }
     exists
   }
@@ -546,24 +588,15 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * at some given index.
    */
   override final def indexWhere(f: A => Boolean, from: Int): Int = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
     var i        = 0
     var result   = -1
-    while (result < 0 && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var j      = 0
-      while (result < 0 & j < length) {
-        if (i >= from) {
-          val a = array(j)
-          if (f(a)) {
-            result = i
-          }
-        }
-        i += 1
-        j += 1
+    while (result < 0 && iterator.hasNextAt(i)) {
+      val a = iterator.nextAt(i)
+      if (i >= from && f(a)) {
+        result = i
       }
-
+      i += 1
     }
     result
   }
@@ -596,21 +629,17 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Statefully maps over the chunk, producing new elements of type `B`.
    */
   final def mapAccum[S1, B](s1: S1)(f1: (S1, A) => (S1, B)): (S1, Chunk[B]) = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     val builder  = ChunkBuilder.make[B]()
     builder.sizeHint(length)
     var s = s1
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a     = array(i)
-        val tuple = f1(s, a)
-        s = tuple._1
-        builder += tuple._2
-        i += 1
-      }
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      val tuple = f1(s, a)
+      s = tuple._1
+      builder += tuple._2
     }
     (s, builder.result())
   }
@@ -619,25 +648,23 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Statefully and effectfully maps over the elements of this chunk to produce
    * new elements.
    */
-  final def mapAccumM[R, E, S1, B](s1: S1)(f1: (S1, A) => ZIO[R, E, (S1, B)]): ZIO[R, E, (S1, Chunk[B])] =
-    ZIO.effectSuspendTotal {
-      val iterator = arrayIterator
+  final def mapAccumZIO[R, E, S1, B](
+    s1: S1
+  )(f1: (S1, A) => ZIO[R, E, (S1, B)])(implicit trace: Trace): ZIO[R, E, (S1, Chunk[B])] =
+    ZIO.suspendSucceed {
+      val iterator = self.chunkIterator
+      var index    = 0
       val builder  = ChunkBuilder.make[B]()
       builder.sizeHint(length)
-      var dest: ZIO[R, E, S1] = UIO.succeedNow(s1)
-      while (iterator.hasNext) {
-        val array  = iterator.next()
-        val length = array.length
-        var i      = 0
-        while (i < length) {
-          val a = array(i)
-          dest = dest.flatMap { state =>
-            f1(state, a).map { case (state2, b) =>
-              builder += b
-              state2
-            }
+      var dest: ZIO[R, E, S1] = ZIO.succeedNow(s1)
+      while (iterator.hasNextAt(index)) {
+        val a = iterator.nextAt(index)
+        index += 1
+        dest = dest.flatMap { state =>
+          f1(state, a).map { case (state2, b) =>
+            builder += b
+            state2
           }
-          i += 1
         }
       }
       dest.map((_, builder.result()))
@@ -646,27 +673,27 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
   /**
    * Effectfully maps the elements of this chunk.
    */
-  final def mapM[R, E, B](f: A => ZIO[R, E, B]): ZIO[R, E, Chunk[B]] =
+  final def mapZIO[R, E, B](f: A => ZIO[R, E, B])(implicit trace: Trace): ZIO[R, E, Chunk[B]] =
     ZIO.foreach(self)(f)
+
+  /**
+   * Effectfully maps the elements of this chunk purely for the effects.
+   */
+  final def mapZIODiscard[R, E](f: A => ZIO[R, E, Any])(implicit trace: Trace): ZIO[R, E, Unit] =
+    ZIO.foreachDiscard(self)(f)
 
   /**
    * Effectfully maps the elements of this chunk in parallel.
    */
-  final def mapMPar[R, E, B](f: A => ZIO[R, E, B]): ZIO[R, E, Chunk[B]] =
+  final def mapZIOPar[R, E, B](f: A => ZIO[R, E, B])(implicit trace: Trace): ZIO[R, E, Chunk[B]] =
     ZIO.foreachPar(self)(f)
 
   /**
    * Effectfully maps the elements of this chunk in parallel purely for the
    * effects.
    */
-  final def mapMPar_[R, E](f: A => ZIO[R, E, Any]): ZIO[R, E, Unit] =
-    ZIO.foreachPar_(self)(f)
-
-  /**
-   * Effectfully maps the elements of this chunk purely for the effects.
-   */
-  final def mapM_[R, E](f: A => ZIO[R, E, Any]): ZIO[R, E, Unit] =
-    ZIO.foreach_(self)(f)
+  final def mapZIOParDiscard[R, E](f: A => ZIO[R, E, Any])(implicit trace: Trace): ZIO[R, E, Unit] =
+    ZIO.foreachParDiscard(self)(f)
 
   /**
    * Materializes a chunk into a chunk backed by an array. This method can
@@ -713,14 +740,16 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     val length    = self.length
     val quotient  = length / n
     val remainder = length % n
-    val iterator  = self.iterator
+    val iterator  = self.chunkIterator
+    var index     = 0
     val chunks    = ChunkBuilder.make[Chunk[A]]()
     var i         = 0
     while (i < remainder) {
       val chunk = ChunkBuilder.make[A]()
       var j     = 0
       while (j <= quotient) {
-        chunk += iterator.next()
+        chunk += iterator.nextAt(index)
+        index += 1
         j += 1
       }
       chunks += chunk.result()
@@ -731,7 +760,8 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
         val chunk = ChunkBuilder.make[A]()
         var j     = 0
         while (j < quotient) {
-          chunk += iterator.next()
+          chunk += iterator.nextAt(index)
+          index += 1
           j += 1
         }
         chunks += chunk.result()
@@ -751,21 +781,15 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Splits this chunk on the first element that matches this predicate.
    */
   final def splitWhere(f: A => Boolean): (Chunk[A], Chunk[A]) = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
     var continue = true
     var i        = 0
-    while (continue && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var j      = 0
-      while (continue && j < length) {
-        val a = array(j)
-        if (f(a)) {
-          continue = false
-        } else {
-          i += 1
-          j += 1
-        }
+    while (continue && iterator.hasNextAt(i)) {
+      val a = iterator.nextAt(i)
+      if (f(a)) {
+        continue = false
+      } else {
+        i += 1
       }
     }
     splitAt(i)
@@ -780,7 +804,10 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     else
       self match {
         case Chunk.Slice(c, o, _) => Chunk.Slice(c, o, n)
-        case _                    => Chunk.Slice(self, 0, n)
+        case Chunk.Concat(l, r) =>
+          if (n > l.length) Chunk.Concat(l, r.take(n - l.length))
+          else l.take(n)
+        case _ => Chunk.Slice(self, 0, n)
       }
 
   /**
@@ -792,28 +819,25 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     else
       self match {
         case Chunk.Slice(c, o, l) => Chunk.Slice(c, o + l - n, n)
-        case _                    => Chunk.Slice(self, length - n, n)
+        case Chunk.Concat(l, r) =>
+          if (n > r.length) Chunk.Concat(l.takeRight(n - r.length), r)
+          else r.takeRight(n)
+        case _ => Chunk.Slice(self, length - n, n)
       }
 
   /**
    * Takes all elements so long as the predicate returns true.
    */
   override def takeWhile(f: A => Boolean): Chunk[A] = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
     var continue = true
     var i        = 0
-    while (continue && iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var j      = 0
-      while (continue && j < length) {
-        val a = array(j)
-        if (!f(a)) {
-          continue = false
-        } else {
-          i += 1
-          j += 1
-        }
+    while (continue && iterator.hasNextAt(i)) {
+      val a = iterator.nextAt(i)
+      if (!f(a)) {
+        continue = false
+      } else {
+        i += 1
       }
     }
     take(i)
@@ -822,30 +846,25 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
   /**
    * Takes all elements so long as the effectual predicate returns true.
    */
-  def takeWhileM[R, E](p: A => ZIO[R, E, Boolean]): ZIO[R, E, Chunk[A]] =
-    ZIO.effectSuspendTotal {
+  def takeWhileZIO[R, E](p: A => ZIO[R, E, Boolean])(implicit trace: Trace): ZIO[R, E, Chunk[A]] =
+    ZIO.suspendSucceed {
       val length  = self.length
       val builder = ChunkBuilder.make[A]()
       builder.sizeHint(length)
-      var taking: ZIO[R, E, Boolean] = UIO.succeedNow(true)
-      val iterator                   = arrayIterator
-      while (iterator.hasNext) {
-        val array  = iterator.next()
-        val length = array.length
-        var i      = 0
-        while (i < length) {
-          val j = i
-          taking = taking.flatMap { b =>
-            val a = array(j)
-            (if (b) p(a) else UIO(false)).map {
-              case true =>
-                builder += a
-                true
-              case false =>
-                false
-            }
+      var taking: ZIO[R, E, Boolean] = ZIO.succeedNow(true)
+      val iterator                   = self.chunkIterator
+      var index                      = 0
+      while (iterator.hasNextAt(index)) {
+        val a = iterator.nextAt(index)
+        index += 1
+        taking = taking.flatMap { b =>
+          (if (b) p(a) else ZIO.succeed(false)).map {
+            case true =>
+              builder += a
+              true
+            case false =>
+              false
           }
-          i += 1
         }
       }
       taking as builder.result()
@@ -890,8 +909,8 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * of elements from each chunk. The returned chunk will have the length of the
    * shorter chunk.
    */
-  final def zip[B](that: Chunk[B]): Chunk[(A, B)] =
-    zipWith(that)((_, _))
+  final def zip[B](that: Chunk[B])(implicit zippable: Zippable[A, B]): Chunk[zippable.Out] =
+    zipWith(that)(zippable.zip(_, _))
 
   /**
    * Zips this chunk with the specified chunk to produce a new chunk with pairs
@@ -914,47 +933,29 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     val length = self.length.max(that.length)
     if (length == 0) Chunk.empty
     else {
-      val leftIterator  = self.arrayIterator
-      val rightIterator = that.arrayIterator
+      val leftIterator  = self.chunkIterator
+      val rightIterator = that.chunkIterator
+      var index         = 0
       val builder       = ChunkBuilder.make[C]()
       builder.sizeHint(length)
-      var leftArray: Array[A]  = null
-      var rightArray: Array[B] = null
-      var leftLength           = 0
-      var rightLength          = 0
-      var i                    = 0
-      var j                    = 0
-      var k                    = 0
-      while (i < length) {
-        if (j < leftLength && k < rightLength) {
-          val a = leftArray(j)
-          val b = rightArray(k)
-          val c = both(a, b)
-          builder += c
-          i += 1
-          j += 1
-          k += 1
-        } else if (j == leftLength && leftIterator.hasNext) {
-          leftArray = leftIterator.next()
-          leftLength = leftArray.length
-          j = 0
-        } else if (k == rightLength && rightIterator.hasNext) {
-          rightArray = rightIterator.next()
-          rightLength = rightArray.length
-          k = 0
-        } else if (j < leftLength) {
-          val a = leftArray(j)
-          val c = left(a)
-          builder += c
-          i += 1
-          j += 1
-        } else if (k < rightLength) {
-          val b = rightArray(k)
-          val c = right(b)
-          builder += c
-          i += 1
-          k += 1
-        }
+      while (leftIterator.hasNextAt(index) && rightIterator.hasNextAt(index)) {
+        val a = leftIterator.nextAt(index)
+        val b = rightIterator.nextAt(index)
+        index += 1
+        val c = both(a, b)
+        builder += c
+      }
+      while (leftIterator.hasNextAt(index)) {
+        val a = leftIterator.nextAt(index)
+        index += 1
+        val c = left(a)
+        builder += c
+      }
+      while (rightIterator.hasNextAt(index)) {
+        val b = rightIterator.nextAt(index)
+        index += 1
+        val c = right(b)
+        builder += c
       }
       builder.result()
     }
@@ -967,35 +968,17 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     val length = self.length.min(that.length)
     if (length == 0) Chunk.empty
     else {
-      val leftIterator  = self.arrayIterator
-      val rightIterator = that.arrayIterator
+      val leftIterator  = self.chunkIterator
+      val rightIterator = that.chunkIterator
+      var index         = 0
       val builder       = ChunkBuilder.make[C]()
       builder.sizeHint(length)
-      var left: Array[A]  = null
-      var right: Array[B] = null
-      var leftLength      = 0
-      var rightLength     = 0
-      var i               = 0
-      var j               = 0
-      var k               = 0
-      while (i < length) {
-        if (j < leftLength && k < rightLength) {
-          val a = left(j)
-          val b = right(k)
-          val c = f(a, b)
-          builder += c
-          i += 1
-          j += 1
-          k += 1
-        } else if (j == leftLength && leftIterator.hasNext) {
-          left = leftIterator.next()
-          leftLength = left.length
-          j = 0
-        } else if (k == rightLength && rightIterator.hasNext) {
-          right = rightIterator.next()
-          rightLength = right.length
-          k = 0
-        }
+      while (leftIterator.hasNextAt(index) && rightIterator.hasNextAt(index)) {
+        val a = leftIterator.nextAt(index)
+        val b = rightIterator.nextAt(index)
+        index += 1
+        val c = f(a, b)
+        builder += c
       }
       builder.result()
     }
@@ -1006,20 +989,16 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * index value.
    */
   final def zipWithIndexFrom(indexOffset: Int): Chunk[(A, Int)] = {
-    val iterator = arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     val builder  = ChunkBuilder.make[(A, Int)]()
     builder.sizeHint(length)
-    var idx = indexOffset
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
-        builder += ((a, idx))
-        i += 1
-        idx += 1
-      }
+    var i = indexOffset
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      builder += ((a, i))
+      i += 1
     }
     builder.result()
   }
@@ -1038,14 +1017,6 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
   }
 
   /**
-   * Returns an `Iterator` that iterates over the arrays underlying this
-   * `Chunk`. Note that this method is side effecting because it allocates
-   * mutable state and should only be used internally.
-   */
-  private[zio] def arrayIterator[A1 >: A]: Iterator[Array[A1]] =
-    materialize.arrayIterator
-
-  /**
    * Returns a filtered, mapped subset of the elements of this chunk.
    */
   protected def collectChunk[B](pf: PartialFunction[A, B]): Chunk[B] =
@@ -1061,19 +1032,15 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
    * Returns a chunk with the elements mapped by the specified function.
    */
   protected def mapChunk[B](f: A => B): Chunk[B] = {
-    val iterator = self.arrayIterator
+    val iterator = self.chunkIterator
+    var index    = 0
     val builder  = ChunkBuilder.make[B]()
     builder.sizeHint(length)
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a = array(i)
-        val b = f(a)
-        builder += b
-        i += 1
-      }
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      val b = f(a)
+      builder += b
     }
     builder.result()
   }
@@ -1087,18 +1054,21 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
     Chunk.PrependN(self, buffer, 1, new AtomicInteger(1))
   }
 
-  /**
-   * Returns an `Iterator` that iterates over the arrays underlying this `Chunk`
-   * in reverse order. While the arrays will be iterated over in reverse order
-   * the ordering of elements in the arrays themselves will not be changed. Note
-   * that this method is side effecting because it allocates mutable state and
-   * should only be used internally.
-   */
-  private[zio] def reverseArrayIterator[A1 >: A]: Iterator[Array[A1]] =
-    materialize.arrayIterator
-
   protected def right: Chunk[A] =
     Chunk.empty
+
+  /**
+   * Updates an element at the specified index of the chunk.
+   */
+  protected def update[A1 >: A](index: Int, a1: A1): Chunk[A1] =
+    if (index < 0 || index >= length) throw new IndexOutOfBoundsException(s"Update chunk access to $index")
+    else {
+      val bufferIndices = Array.ofDim[Int](Chunk.UpdateBufferSize)
+      val bufferValues  = Array.ofDim[AnyRef](Chunk.UpdateBufferSize)
+      bufferIndices(0) = index
+      bufferValues(0) = a1.asInstanceOf[AnyRef]
+      Chunk.Update(self, bufferIndices, bufferValues, 1, new AtomicInteger(1))
+    }
 
   private final def fromBuilder[A1 >: A, B[_]](builder: Builder[A1, B[A1]]): B[A1] = {
     val c   = materialize
@@ -1125,16 +1095,55 @@ sealed abstract class Chunk[+A] extends ChunkLike[A] { self =>
 object Chunk extends ChunkFactory with ChunkPlatformSpecific {
 
   /**
-   * Returns the empty chunk.
-   */
-  val empty: Chunk[Nothing] =
-    Empty
-
-  /**
    * Returns a chunk from a number of values.
    */
   override def apply[A](as: A*): Chunk[A] =
     fromIterable(as)
+
+  /*
+   * Performs bitwise operations on boolean chunks returning a Chunk.BitChunk
+   */
+  private def bitwise(
+    left: Chunk[Boolean],
+    right: Chunk[Boolean],
+    op: (Boolean, Boolean) => Boolean
+  ): Chunk.BitChunkByte = {
+    val bits      = left.length min right.length
+    val fullBytes = bits >> 3
+    val remBits   = bits & 7
+    val arr = Array.ofDim[Byte](
+      if (remBits == 0) fullBytes else fullBytes + 1
+    )
+    var i    = 0
+    var mask = 128
+    while (i < fullBytes) {
+      var byte = 0
+      mask = 128
+      (0 until 8).foreach { k =>
+        byte = byte | (if (op(left(i * 8 + k), right(i * 8 + k))) mask else 0)
+        mask >>= 1
+      }
+      arr(i) = byte.toByte
+      i += 1
+    }
+    if (remBits != 0) {
+      val offset = fullBytes * 8
+      var byte   = 0
+      mask = 128
+      (0 until remBits).foreach { k =>
+        byte = byte | (if (op(left(offset + k), right(offset + k))) mask else 0)
+        mask >>= 1
+      }
+      arr(fullBytes) = byte.toByte
+    }
+    Chunk.BitChunkByte(Chunk.fromArray(arr), 0, bits)
+  }
+
+  /**
+   * Returns the empty chunk.
+   */
+  override def empty[A]: Chunk[A] =
+    Empty
 
   /**
    * Returns a chunk backed by an array.
@@ -1145,15 +1154,15 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     (if (array.isEmpty) Empty
      else
        (array.asInstanceOf[AnyRef]: @unchecked) match {
-         case x: Array[AnyRef]  => AnyRefArray(x)
-         case x: Array[Int]     => IntArray(x)
-         case x: Array[Double]  => DoubleArray(x)
-         case x: Array[Long]    => LongArray(x)
-         case x: Array[Float]   => FloatArray(x)
-         case x: Array[Char]    => CharArray(x)
-         case x: Array[Byte]    => ByteArray(x)
-         case x: Array[Short]   => ShortArray(x)
-         case x: Array[Boolean] => BooleanArray(x)
+         case x: Array[AnyRef]  => AnyRefArray(x, 0, array.length)
+         case x: Array[Int]     => IntArray(x, 0, array.length)
+         case x: Array[Double]  => DoubleArray(x, 0, array.length)
+         case x: Array[Long]    => LongArray(x, 0, array.length)
+         case x: Array[Float]   => FloatArray(x, 0, array.length)
+         case x: Array[Char]    => CharArray(x, 0, array.length)
+         case x: Array[Byte]    => ByteArray(x, 0, array.length)
+         case x: Array[Short]   => ShortArray(x, 0, array.length)
+         case x: Array[Boolean] => BooleanArray(x, 0, array.length)
        }).asInstanceOf[Chunk[A]]
 
   /**
@@ -1257,6 +1266,24 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     builder.result()
   }
 
+  /**
+   * Returns a chunk backed by a Java iterable.
+   */
+  def fromJavaIterable[A](iterable: java.lang.Iterable[A]): Chunk[A] =
+    fromJavaIterator(iterable.iterator)
+
+  /**
+   * Creates a chunk from a Java iterator.
+   */
+  def fromJavaIterator[A](iterator: java.util.Iterator[A]): Chunk[A] = {
+    val builder = ChunkBuilder.make[A]()
+    while (iterator.hasNext()) {
+      val a = iterator.next()
+      builder += a
+    }
+    builder.result()
+  }
+
   override def fill[A](n: Int)(elem: => A): Chunk[A] =
     if (n <= 0) Chunk.empty
     else {
@@ -1270,6 +1297,9 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       }
       builder.result()
     }
+
+  def newBuilder[A]: ChunkBuilder[A] =
+    ChunkBuilder.make()
 
   /**
    * Returns a singleton chunk, eagerly evaluated.
@@ -1303,8 +1333,10 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
    * Constructs a `Chunk` by repeatedly applying the effectual function `f` as
    * long as it returns `Some`.
    */
-  def unfoldM[R, E, A, S](s: S)(f: S => ZIO[R, E, Option[(A, S)]]): ZIO[R, E, Chunk[A]] =
-    ZIO.effectSuspendTotal {
+  def unfoldZIO[R, E, A, S](
+    s: S
+  )(f: S => ZIO[R, E, Option[(A, S)]])(implicit trace: Trace): ZIO[R, E, Chunk[A]] =
+    ZIO.suspendSucceed {
 
       def go(s: S, builder: ChunkBuilder[A]): ZIO[R, E, Chunk[A]] =
         f(s).flatMap {
@@ -1325,15 +1357,16 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
    */
   private[zio] def classTagOf[A](chunk: Chunk[A]): ClassTag[A] =
     chunk match {
-      case x: AppendN[A]     => x.classTag
-      case x: Arr[A]         => x.classTag
-      case x: Concat[A]      => x.classTag
+      case x: AppendN[_]     => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: Arr[_]         => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: Concat[_]      => x.classTag.asInstanceOf[ClassTag[A]]
       case Empty             => classTag[java.lang.Object].asInstanceOf[ClassTag[A]]
-      case x: PrependN[A]    => x.classTag
-      case x: Singleton[A]   => x.classTag
-      case x: Slice[A]       => x.classTag
-      case x: VectorChunk[A] => x.classTag
-      case _: BitChunk       => ClassTag.Boolean.asInstanceOf[ClassTag[A]]
+      case x: PrependN[_]    => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: Singleton[_]   => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: Slice[_]       => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: Update[_]      => x.classTag.asInstanceOf[ClassTag[A]]
+      case x: VectorChunk[_] => x.classTag.asInstanceOf[ClassTag[A]]
+      case _: BitChunk[_]    => ClassTag.Boolean.asInstanceOf[ClassTag[A]]
     }
 
   /**
@@ -1342,8 +1375,17 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
   private val BufferSize: Int =
     64
 
+  /**
+   * The maximum number of elements in the buffer for fast update.
+   */
+  private val UpdateBufferSize: Int =
+    256
+
   private final case class AppendN[A](start: Chunk[A], buffer: Array[AnyRef], bufferUsed: Int, chain: AtomicInteger)
       extends Chunk[A] { self =>
+
+    def chunkIterator: ChunkIterator[A] =
+      start.chunkIterator ++ ChunkIterator.fromArray(buffer.asInstanceOf[Array[A]]).sliceIterator(0, bufferUsed)
 
     implicit val classTag: ClassTag[A] = classTagOf(start)
 
@@ -1362,7 +1404,9 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       }
 
     def apply(n: Int): A =
-      if (n < start.length) start(n) else buffer(n - start.length).asInstanceOf[A]
+      if (n < 0 || n >= length) throw new IndexOutOfBoundsException(s"Append chunk access to $n")
+      else if (n < start.length) start(n)
+      else buffer(n - start.length).asInstanceOf[A]
 
     override protected[zio] def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit = {
       start.toArray(n, dest)
@@ -1372,6 +1416,11 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
 
   private final case class PrependN[A](end: Chunk[A], buffer: Array[AnyRef], bufferUsed: Int, chain: AtomicInteger)
       extends Chunk[A] { self =>
+
+    def chunkIterator: ChunkIterator[A] =
+      ChunkIterator
+        .fromArray(buffer.asInstanceOf[Array[A]])
+        .sliceIterator(BufferSize - bufferUsed, bufferUsed) ++ end.chunkIterator
 
     implicit val classTag: ClassTag[A] = classTagOf(end)
 
@@ -1390,12 +1439,71 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       }
 
     def apply(n: Int): A =
-      if (n < bufferUsed) buffer(BufferSize - bufferUsed + n).asInstanceOf[A] else end(n - bufferUsed)
+      if (n < 0 || n >= length) throw new IndexOutOfBoundsException(s"Prepend chunk access to $n")
+      else if (n < bufferUsed) buffer(BufferSize - bufferUsed + n).asInstanceOf[A]
+      else end(n - bufferUsed)
 
     override protected[zio] def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit = {
       val length = math.min(bufferUsed, math.max(dest.length - n, 0))
       Array.copy(buffer, BufferSize - bufferUsed, dest, n, length)
       val _ = end.toArray(n + length, dest)
+    }
+  }
+
+  private final case class Update[A](
+    chunk: Chunk[A],
+    bufferIndices: Array[Int],
+    bufferValues: Array[AnyRef],
+    used: Int,
+    chain: AtomicInteger
+  ) extends Chunk[A] { self =>
+
+    def chunkIterator: ChunkIterator[A] =
+      ChunkIterator.fromArray(self.toArray)
+
+    implicit val classTag: ClassTag[A] = Chunk.classTagOf(chunk)
+
+    val length: Int =
+      chunk.length
+
+    def apply(i: Int): A = {
+      var j = used - 1
+      var a = null.asInstanceOf[A]
+      while (j >= 0) {
+        if (bufferIndices(j) == i) {
+          a = bufferValues(j).asInstanceOf[A]
+          j = -1
+        } else {
+          j -= 1
+        }
+      }
+      if (a != null) a else chunk(i)
+    }
+
+    override protected def update[A1 >: A](i: Int, a: A1): Chunk[A1] =
+      if (i < 0 || i >= length) throw new IndexOutOfBoundsException(s"Update chunk access to $i")
+      else if (used < UpdateBufferSize && chain.compareAndSet(used, used + 1)) {
+        bufferIndices(used) = i
+        bufferValues(used) = a.asInstanceOf[AnyRef]
+        Update(chunk, bufferIndices, bufferValues, used + 1, chain)
+      } else {
+        val bufferIndices = Array.ofDim[Int](UpdateBufferSize)
+        val bufferValues  = Array.ofDim[AnyRef](UpdateBufferSize)
+        bufferIndices(0) = i
+        bufferValues(0) = a.asInstanceOf[AnyRef]
+        val array = self.asInstanceOf[Chunk[AnyRef]].toArray
+        Update(Chunk.fromArray(array.asInstanceOf[Array[A1]]), bufferIndices, bufferValues, 1, new AtomicInteger(1))
+      }
+
+    override protected[zio] def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit = {
+      chunk.toArray(n, dest)
+      var i = 0
+      while (i < used) {
+        val index = bufferIndices(i)
+        val value = self.bufferValues(i)
+        dest(index) = value.asInstanceOf[A1]
+        i += 1
+      }
     }
   }
 
@@ -1406,18 +1514,14 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     implicit val classTag: ClassTag[A] =
       ClassTag(array.getClass.getComponentType)
 
-    override val length: Int =
-      array.length
-
-    override def apply(n: Int): A =
-      array(n)
-
-    override def collectM[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]]): ZIO[R, E, Chunk[B]] = ZIO.effectSuspendTotal {
+    override def collectZIO[R, E, B](
+      pf: PartialFunction[A, ZIO[R, E, B]]
+    )(implicit trace: Trace): ZIO[R, E, Chunk[B]] = ZIO.suspendSucceed {
       val len     = array.length
       val builder = ChunkBuilder.make[B]()
       builder.sizeHint(len)
-      val orElse                           = (_: A) => UIO.succeedNow(null.asInstanceOf[B])
-      var dest: ZIO[R, E, ChunkBuilder[B]] = UIO.succeedNow(builder)
+      val orElse                           = (_: A) => ZIO.succeedNow(null.asInstanceOf[B])
+      var dest: ZIO[R, E, ChunkBuilder[B]] = ZIO.succeedNow(builder)
 
       var i = 0
       while (i < len) {
@@ -1456,18 +1560,20 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       builder.result()
     }
 
-    override def collectWhileM[R, E, B](pf: PartialFunction[A, ZIO[R, E, B]]): ZIO[R, E, Chunk[B]] =
-      ZIO.effectSuspendTotal {
+    override def collectWhileZIO[R, E, B](
+      pf: PartialFunction[A, ZIO[R, E, B]]
+    )(implicit trace: Trace): ZIO[R, E, Chunk[B]] =
+      ZIO.suspendSucceed {
         val len     = self.length
         val builder = ChunkBuilder.make[B]()
         builder.sizeHint(len)
-        var dest: ZIO[R, E, ChunkBuilder[B]] = IO.succeedNow(builder)
+        var dest: ZIO[R, E, ChunkBuilder[B]] = ZIO.succeedNow(builder)
 
         var i    = 0
         var done = false
         val orElse = (_: A) => {
           done = true
-          UIO.succeedNow(null.asInstanceOf[B])
+          ZIO.succeedNow(null.asInstanceOf[B])
         }
 
         while (!done && i < len) {
@@ -1544,6 +1650,9 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     override def foreach[B](f: A => B): Unit =
       array.foreach(f)
 
+    override def iterator: Iterator[A] =
+      array.iterator
+
     override def materialize[A1 >: A]: Chunk[A1] =
       self
 
@@ -1564,9 +1673,6 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
 
     override protected[zio] def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit =
       Array.copy(array, 0, dest, n, length)
-
-    override private[zio] def arrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      Iterator.single(array.asInstanceOf[Array[A1]])
 
     override protected def collectChunk[B](pf: PartialFunction[A, B]): Chunk[B] = {
       val len     = self.length
@@ -1598,14 +1704,14 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
 
       builder.result()
     }
-
-    override private[zio] def reverseArrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      Iterator.single(array.asInstanceOf[Array[A1]])
   }
 
   private final case class Concat[A](override protected val left: Chunk[A], override protected val right: Chunk[A])
       extends Chunk[A] {
     self =>
+
+    def chunkIterator: ChunkIterator[A] =
+      left.chunkIterator ++ right.chunkIterator
 
     implicit val classTag: ClassTag[A] =
       left match {
@@ -1627,19 +1733,16 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       right.foreach(f)
     }
 
+    override def iterator: Iterator[A] =
+      left.iterator ++ right.iterator
+
     override def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit = {
       left.toArray(n, dest)
       right.toArray(n + left.length, dest)
     }
-
-    override private[zio] def arrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      (left.arrayIterator ++ right.arrayIterator).asInstanceOf[Iterator[Array[A1]]]
-
-    override private[zio] def reverseArrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      (right.reverseArrayIterator ++ left.reverseArrayIterator).asInstanceOf[Iterator[Array[A1]]]
   }
 
-  private final case class Singleton[A](a: A) extends Chunk[A] {
+  private final case class Singleton[A](a: A) extends Chunk[A] with ChunkIterator[A] { self =>
 
     implicit val classTag: ClassTag[A] =
       Tags.fromValue(a)
@@ -1658,14 +1761,25 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     override def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit =
       dest(n) = a
 
-    private[zio] override def arrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      Iterator.single(Array(a).asInstanceOf[Array[A1]])
+    def chunkIterator: ChunkIterator[A] =
+      self
 
-    private[zio] override def reverseArrayIterator[A1 >: A]: Iterator[Array[A1]] =
-      arrayIterator
+    def hasNextAt(index: Int): Boolean =
+      index == 0
+
+    def nextAt(index: Int): A =
+      if (index == 0) a
+      else throw new ArrayIndexOutOfBoundsException(s"Singleton chunk access to $index")
+
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[A] =
+      if (offset <= 0 && length >= 1) self
+      else ChunkIterator.empty
   }
 
   private final case class Slice[A](private val chunk: Chunk[A], offset: Int, l: Int) extends Chunk[A] {
+
+    def chunkIterator: ChunkIterator[A] =
+      chunk.chunkIterator.sliceIterator(offset, l)
 
     implicit val classTag: ClassTag[A] =
       classTagOf(chunk)
@@ -1684,6 +1798,9 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
       }
     }
 
+    override def iterator: Iterator[A] =
+      chunk.iterator.slice(offset, offset + l)
+
     override def toArray[A1 >: A](n: Int, dest: Array[A1]): Unit = {
       var i = 0
       var j = n
@@ -1698,6 +1815,9 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
   }
 
   private final case class VectorChunk[A](private val vector: Vector[A]) extends Chunk[A] {
+
+    def chunkIterator: ChunkIterator[A] =
+      ChunkIterator.fromVector(vector)
 
     implicit val classTag: ClassTag[A] =
       Tags.fromValue(vector(0))
@@ -1716,80 +1836,522 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
     }
   }
 
-  private[zio] final case class BitChunk(bytes: Chunk[Byte], minBitIndex: Int, maxBitIndex: Int)
-      extends Chunk[Boolean] {
+  private[zio] trait BitOps[T] {
+    def zero: T
+    def one: T
+    def reverse(a: T): T
+    def <<(x: T, n: Int): T
+    def >>(x: T, n: Int): T
+    def |(x: T, y: T): T
+    def &(x: T, y: T): T
+    def ^(x: T, y: T): T
+    def unary_~(x: T): T
+  }
+
+  private[zio] object BitOps {
+    def apply[T](implicit ops: BitOps[T]): BitOps[T] = ops
+    implicit val ByteOps: BitOps[Byte] = new BitOps[Byte] {
+      def zero: Byte                = 0
+      def one: Byte                 = 1
+      def reverse(a: Byte): Byte    = throw new UnsupportedOperationException
+      def <<(x: Byte, n: Int): Byte = (x << n).toByte
+      def >>(x: Byte, n: Int): Byte = (x >> n).toByte
+      def |(x: Byte, y: Byte): Byte = (x | y).toByte
+      def &(x: Byte, y: Byte): Byte = (x & y).toByte
+      def ^(x: Byte, y: Byte): Byte = (x ^ y).toByte
+      def unary_~(x: Byte): Byte    = (~x).toByte
+    }
+    implicit val IntOps: BitOps[Int] = new BitOps[Int] {
+      def zero: Int               = 0
+      def one: Int                = 1
+      def reverse(a: Int): Int    = Integer.reverse(a)
+      def <<(x: Int, n: Int): Int = x << n
+      def >>(x: Int, n: Int): Int = x >> n
+      def |(x: Int, y: Int): Int  = x | y
+      def &(x: Int, y: Int): Int  = x & y
+      def ^(x: Int, y: Int): Int  = x ^ y
+      def unary_~(x: Int): Int    = ~x
+    }
+    implicit val LongOps: BitOps[Long] = new BitOps[Long] {
+      def zero: Long                = 0L
+      def one: Long                 = 1L
+      def reverse(a: Long): Long    = java.lang.Long.reverse(a)
+      def <<(x: Long, n: Int): Long = x << n
+      def >>(x: Long, n: Int): Long = x >> n
+      def |(x: Long, y: Long): Long = x | y
+      def &(x: Long, y: Long): Long = x & y
+      def ^(x: Long, y: Long): Long = x ^ y
+      def unary_~(x: Long): Long    = ~x
+    }
+  }
+
+  private[zio] sealed abstract class BitChunk[T](
+    chunk: Chunk[T],
+    val bits: Int
+  ) extends Chunk[Boolean]
+      with ChunkIterator[Boolean] {
+    self =>
+
+    protected val minBitIndex: Int
+    protected val maxBitIndex: Int
+
+    protected val bitsLog2: Int = (log(bits.toDouble) / log(2d)).toInt
+
+    val length: Int =
+      maxBitIndex - minBitIndex
+
+    protected def elementAt(n: Int): T
+
+    protected def newBitChunk(chunk: Chunk[T], min: Int, max: Int): BitChunk[T]
+
+    override def drop(n: Int): Chunk[Boolean] = {
+      val index  = (minBitIndex + n) min maxBitIndex
+      val toDrop = index >> bitsLog2
+      val min    = index & bits - 1
+      val max    = maxBitIndex - index + min
+      newBitChunk(chunk.drop(toDrop), min, max)
+    }
+
+    override def take(n: Int): Chunk[Boolean] = {
+      val index  = (minBitIndex + n) min maxBitIndex
+      val toTake = (index + bits - 1) >> bitsLog2
+      newBitChunk(chunk.take(toTake), minBitIndex, index)
+    }
+
+    override def foreach[A](f: Boolean => A): Unit = {
+      val minLongIndex    = (minBitIndex + bits - 1) >> bitsLog2
+      val maxLongIndex    = maxBitIndex >> bitsLog2
+      val minFullBitIndex = (minLongIndex << bitsLog2) min maxBitIndex
+      val maxFullBitIndex = (maxLongIndex << bitsLog2) max minFullBitIndex
+      var i               = minBitIndex
+      while (i < minFullBitIndex) {
+        f(self.apply(i))
+        i += 1
+      }
+      i = minLongIndex
+      while (i < maxLongIndex) {
+        foreachElement(f, elementAt(i))
+        i += 1
+      }
+      i = maxFullBitIndex
+      while (i < maxBitIndex) {
+        f(self.apply(i))
+        i += 1
+      }
+    }
+
+    protected def foreachElement[A](f: Boolean => A, elem: T): Unit
+
+    override def toArray[A1 >: Boolean](n: Int, dest: Array[A1]): Unit = {
+      var i = n
+      while (i < length) {
+        dest(i + n) = self.apply(i)
+        i += 1
+      }
+    }
+
+    def chunkIterator: ChunkIterator[Boolean] =
+      self
+
+    def hasNextAt(index: Int): Boolean =
+      index < length
+
+    def nextAt(index: Int): Boolean =
+      self(index)
+
+    override def slice(from: Int, until: Int): BitChunk[T] = {
+      val lo = from max 0
+      if (lo <= 0 && until >= self.length) self
+      else if (lo >= self.length || until <= lo) newBitChunk(Chunk.empty, 0, 0)
+      else newBitChunk(chunk, self.minBitIndex + lo, self.minBitIndex + until min self.maxBitIndex)
+    }
+
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Boolean] = {
+      val lo = offset max 0
+      if (lo <= 0 && length >= self.length) self
+      else if (lo >= self.length || length <= 0) ChunkIterator.empty
+      else newBitChunk(chunk, self.minBitIndex + lo, self.minBitIndex + lo + length min self.maxBitIndex)
+    }
+
+  }
+
+  object BitChunk {
+    sealed trait Endianness
+    object Endianness {
+      case object BigEndian    extends Endianness
+      case object LittleEndian extends Endianness
+    }
+
+  }
+
+  private[zio] final case class BitChunkByte(bytes: Chunk[Byte], minBitIndex: Int, maxBitIndex: Int)
+      extends BitChunk[Byte](bytes, 8) {
     self =>
 
     override val length: Int =
       maxBitIndex - minBitIndex
 
     override def apply(n: Int): Boolean =
-      (bytes(n >> 3) & (1 << (7 - (n & 7)))) != 0
+      (bytes(n >> bitsLog2) & (1 << (bits - 1 - (n & bits - 1)))) != 0
 
-    override def drop(n: Int): BitChunk = {
-      val index  = (minBitIndex + n) min maxBitIndex
-      val toDrop = index >> 3
-      val min    = index & 7
-      val max    = maxBitIndex - index + min
-      BitChunk(bytes.drop(toDrop), min, max)
+    override protected def elementAt(n: Int): Byte = bytes(n)
+
+    override protected def newBitChunk(bytes: Chunk[Byte], min: Int, max: Int): BitChunk[Byte] =
+      BitChunkByte(bytes, min, max)
+
+    override protected def foreachElement[A](f: Boolean => A, byte: Byte): Unit = {
+      f((byte & 128) != 0)
+      f((byte & 64) != 0)
+      f((byte & 32) != 0)
+      f((byte & 16) != 0)
+      f((byte & 8) != 0)
+      f((byte & 4) != 0)
+      f((byte & 2) != 0)
+      f((byte & 1) != 0)
+      ()
     }
 
-    override def foreach[A](f: Boolean => A): Unit = {
-      val minByteIndex    = (minBitIndex + 7) >> 3
-      val maxByteIndex    = maxBitIndex >> 3
-      val minFullBitIndex = (minByteIndex << 3) min maxBitIndex
-      val maxFullBitIndex = (maxByteIndex << 3) max minFullBitIndex
-      var i               = minBitIndex
-      while (i < minFullBitIndex) {
-        f(apply(i))
-        i += 1
-      }
-      i = minByteIndex
-      while (i < maxByteIndex) {
-        val byte = bytes(i)
-        f((byte & 128) != 0)
-        f((byte & 64) != 0)
-        f((byte & 32) != 0)
-        f((byte & 16) != 0)
-        f((byte & 8) != 0)
-        f((byte & 4) != 0)
-        f((byte & 2) != 0)
-        f((byte & 1) != 0)
-        i += 1
-      }
-      i = maxFullBitIndex
-      while (i < maxBitIndex) {
-        f(apply(i))
-        i += 1
-      }
-    }
+    override def toPackedByte(implicit ev: Boolean <:< Boolean): Chunk[Byte] =
+      if (minBitIndex == maxBitIndex) Chunk.empty
+      else if ((minBitIndex & bits - 1) != 0) ChunkPackedBoolean[Byte](self, bits, BitChunk.Endianness.BigEndian)
+      else if ((maxBitIndex & bits - 1) != 0) {
+        val minByteIndex = minBitIndex >> bitsLog2
+        val maxByteIndex = maxBitIndex >> bitsLog2
+        val maxByte      = bytes(maxByteIndex)
+        val maxByteValue = (maxByte & 0xff) >> bits - (maxBitIndex & bits - 1)
+        bytes.slice(minByteIndex, maxByteIndex) :+ maxByteValue.toByte
+      } else bytes
 
-    override def take(n: Int): BitChunk = {
-      val index  = (minBitIndex + n) min maxBitIndex
-      val toTake = (index + 7) >> 3
-      BitChunk(bytes.take(toTake), minBitIndex, index)
-    }
-
-    override def toArray[A1 >: Boolean](n: Int, dest: Array[A1]): Unit = {
-      var i = n
-      while (i < length) {
-        dest(i + n) = apply(i)
-        i += 1
+    private def nthByte(n: Int): Byte = {
+      val offset    = minBitIndex & 7
+      val startByte = minBitIndex >> 3
+      if (offset == 0) {
+        bytes(n + startByte)
+      } else {
+        val leftover = minBitIndex + (n + 1) * 8 - maxBitIndex
+        if (leftover <= 0) {
+          val index  = n + startByte
+          val first  = ((255 >> offset) & bytes(index)) << offset
+          val second = (255 << (8 - offset) & 255 & bytes(index + 1)) >> (8 - offset)
+          (first | second).asInstanceOf[Byte]
+        } else {
+          throw new ArrayIndexOutOfBoundsException(s"There are only $leftover bits left.")
+        }
       }
     }
 
-    override private[zio] def arrayIterator[A1 >: Boolean]: Iterator[Array[A1]] = {
-      val array = Array.ofDim[Boolean](length)
-      toArray(0, array)
-      Iterator.single(array.asInstanceOf[Array[A1]])
+    private def bitwise(that: BitChunkByte, f: (Byte, Byte) => Byte, g: (Boolean, Boolean) => Boolean): BitChunkByte = {
+      val bits      = self.length min that.length
+      val bytes     = bits >> 3
+      val leftovers = bits - bytes * 8
+      val arr = Array.ofDim[Byte](
+        if (leftovers == 0) bytes else bytes + 1
+      )
+
+      (0 until bytes).foreach { n =>
+        arr(n) = f(self.nthByte(n), that.nthByte(n))
+      }
+
+      if (leftovers != 0) {
+        val offset     = bytes * 8
+        var last: Byte = null.asInstanceOf[Byte]
+        var mask       = 128
+        var i          = 0
+        while (i < leftovers) {
+          if (g(self.apply(offset + self.minBitIndex + i), that.apply(offset + that.minBitIndex + i)))
+            last = (last | mask).asInstanceOf[Byte]
+          i += 1
+          mask >>= 1
+        }
+        arr(bytes) = last
+      }
+
+      BitChunkByte(Chunk.fromArray(arr), 0, bits)
     }
 
-    override private[zio] def reverseArrayIterator[A1 >: Boolean]: Iterator[Array[A1]] =
-      arrayIterator
+    def and(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l & r).asInstanceOf[Byte], _ && _)
+
+    def &(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l & r).asInstanceOf[Byte], _ && _)
+
+    def or(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l | r).asInstanceOf[Byte], _ || _)
+
+    def |(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l | r).asInstanceOf[Byte], _ || _)
+
+    def xor(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l ^ r).asInstanceOf[Byte], _ ^ _)
+
+    def ^(that: BitChunkByte): BitChunkByte =
+      bitwise(that, (l, r) => (l ^ r).asInstanceOf[Byte], _ ^ _)
+
+    def negate: BitChunkByte = {
+      val bits      = self.length
+      val bytes     = bits >> 3
+      val leftovers = bits - bytes * 8
+
+      val arr = Array.ofDim[Byte](
+        if (leftovers == 0) bytes else bytes + 1
+      )
+
+      (0 until bytes).foreach { n =>
+        arr(n) = (~self.nthByte(n)).asInstanceOf[Byte]
+      }
+
+      if (leftovers != 0) {
+        val offset     = bytes * 8 + self.minBitIndex
+        var last: Byte = null.asInstanceOf[Byte]
+        var mask       = 128
+        var i          = 0
+        while (i < leftovers) {
+          if (!self.apply(offset + i))
+            last = (last | mask).asInstanceOf[Byte]
+          i += 1
+          mask >>= 1
+        }
+        arr(bytes) = last
+      }
+
+      BitChunkByte(Chunk.fromArray(arr), 0, bits)
+    }
+  }
+
+  private[zio] final case class BitChunkInt(
+    ints: Chunk[Int],
+    endianness: BitChunk.Endianness,
+    minBitIndex: Int,
+    maxBitIndex: Int
+  ) extends BitChunk[Int](ints, 32) {
+    self =>
+
+    override val length: Int =
+      maxBitIndex - minBitIndex
+
+    override protected def elementAt(n: Int): Int =
+      respectEndian(endianness, ints(n))
+
+    override def apply(n: Int): Boolean =
+      (elementAt(n >> bitsLog2) & (1 << (bits - 1 - (n & bits - 1)))) != 0
+
+    override protected def newBitChunk(chunk: Chunk[Int], min: Int, max: Int): BitChunk[Int] =
+      BitChunkInt(chunk, endianness, min, max)
+
+    override protected def foreachElement[A](f: Boolean => A, int: Int): Unit = {
+      f((int & 0x80000000) != 0)
+      f((int & 0x40000000) != 0)
+      f((int & 0x20000000) != 0)
+      f((int & 0x10000000) != 0)
+      f((int & 0x8000000) != 0)
+      f((int & 0x4000000) != 0)
+      f((int & 0x2000000) != 0)
+      f((int & 0x1000000) != 0)
+      f((int & 0x800000) != 0)
+      f((int & 0x400000) != 0)
+      f((int & 0x200000) != 0)
+      f((int & 0x100000) != 0)
+      f((int & 0x80000) != 0)
+      f((int & 0x40000) != 0)
+      f((int & 0x20000) != 0)
+      f((int & 0x10000) != 0)
+      f((int & 0x8000) != 0)
+      f((int & 0x4000) != 0)
+      f((int & 0x2000) != 0)
+      f((int & 0x1000) != 0)
+      f((int & 0x800) != 0)
+      f((int & 0x400) != 0)
+      f((int & 0x200) != 0)
+      f((int & 0x100) != 0)
+      f((int & 0x80) != 0)
+      f((int & 0x40) != 0)
+      f((int & 0x20) != 0)
+      f((int & 0x10) != 0)
+      f((int & 0x8) != 0)
+      f((int & 0x4) != 0)
+      f((int & 0x2) != 0)
+      f((int & 0x1) != 0)
+      ()
+    }
+
+    override def toPackedInt(endianness: BitChunk.Endianness)(implicit ev: Boolean <:< Boolean): Chunk[Int] =
+      if (minBitIndex == maxBitIndex) Chunk.empty
+      else if ((minBitIndex & bits - 1) != 0) ChunkPackedBoolean[Int](self, bits, endianness)
+      else if ((maxBitIndex & bits - 1) != 0) {
+        val minIntIndex = minBitIndex >> bitsLog2
+        val maxIntIndex = maxBitIndex >> bitsLog2
+        val maxInt      = elementAt(maxIntIndex)
+        val maxIntValue = maxInt >>> bits - (maxBitIndex & bits - 1)
+        val fullInts    = ints.slice(minIntIndex, maxIntIndex)
+
+        if (self.endianness == endianness) fullInts :+ respectEndian(endianness, maxIntValue)
+        else fullInts.map(Integer.reverse) :+ respectEndian(endianness, maxIntValue)
+
+      } else if (self.endianness == endianness) ints
+      else ints.map(Integer.reverse)
+
+    private def respectEndian(endianness: BitChunk.Endianness, bigEndianValue: Int) =
+      if (endianness == BitChunk.Endianness.BigEndian) bigEndianValue
+      else Integer.reverse(bigEndianValue)
+  }
+
+  private[zio] final case class BitChunkLong(
+    longs: Chunk[Long],
+    endianness: BitChunk.Endianness,
+    minBitIndex: Int,
+    maxBitIndex: Int
+  ) extends BitChunk[Long](longs, 64) {
+    self =>
+
+    override protected def elementAt(n: Int): Long =
+      if (endianness == BitChunk.Endianness.BigEndian) longs(n) else java.lang.Long.reverse(longs(n))
+
+    def apply(n: Int): Boolean =
+      (elementAt(n >> bitsLog2) & (1L << (bits - 1 - (n & bits - 1)))) != 0
+
+    override protected def newBitChunk(longs: Chunk[Long], min: Int, max: Int): BitChunk[Long] =
+      BitChunkLong(longs, endianness, min, max)
+
+    override protected def foreachElement[A](f: Boolean => A, long: Long): Unit = {
+      f((long & 0x8000000000000000L) != 0)
+      f((long & 0x4000000000000000L) != 0)
+      f((long & 0x2000000000000000L) != 0)
+      f((long & 0x1000000000000000L) != 0)
+      f((long & 0x800000000000000L) != 0)
+      f((long & 0x400000000000000L) != 0)
+      f((long & 0x200000000000000L) != 0)
+      f((long & 0x100000000000000L) != 0)
+      f((long & 0x80000000000000L) != 0)
+      f((long & 0x40000000000000L) != 0)
+      f((long & 0x20000000000000L) != 0)
+      f((long & 0x10000000000000L) != 0)
+      f((long & 0x8000000000000L) != 0)
+      f((long & 0x4000000000000L) != 0)
+      f((long & 0x2000000000000L) != 0)
+      f((long & 0x1000000000000L) != 0)
+      f((long & 0x800000000000L) != 0)
+      f((long & 0x400000000000L) != 0)
+      f((long & 0x200000000000L) != 0)
+      f((long & 0x100000000000L) != 0)
+      f((long & 0x80000000000L) != 0)
+      f((long & 0x40000000000L) != 0)
+      f((long & 0x20000000000L) != 0)
+      f((long & 0x10000000000L) != 0)
+      f((long & 0x8000000000L) != 0)
+      f((long & 0x4000000000L) != 0)
+      f((long & 0x2000000000L) != 0)
+      f((long & 0x1000000000L) != 0)
+      f((long & 0x800000000L) != 0)
+      f((long & 0x400000000L) != 0)
+      f((long & 0x200000000L) != 0)
+      f((long & 0x100000000L) != 0)
+      f((long & 0x80000000L) != 0)
+      f((long & 0x40000000L) != 0)
+      f((long & 0x20000000L) != 0)
+      f((long & 0x10000000L) != 0)
+      f((long & 0x8000000L) != 0)
+      f((long & 0x4000000L) != 0)
+      f((long & 0x2000000L) != 0)
+      f((long & 0x1000000L) != 0)
+      f((long & 0x800000L) != 0)
+      f((long & 0x400000L) != 0)
+      f((long & 0x200000L) != 0)
+      f((long & 0x100000L) != 0)
+      f((long & 0x80000L) != 0)
+      f((long & 0x40000L) != 0)
+      f((long & 0x20000L) != 0)
+      f((long & 0x10000L) != 0)
+      f((long & 0x8000L) != 0)
+      f((long & 0x4000L) != 0)
+      f((long & 0x2000L) != 0)
+      f((long & 0x1000L) != 0)
+      f((long & 0x800L) != 0)
+      f((long & 0x400L) != 0)
+      f((long & 0x200L) != 0)
+      f((long & 0x100L) != 0)
+      f((long & 0x80L) != 0)
+      f((long & 0x40L) != 0)
+      f((long & 0x20L) != 0)
+      f((long & 0x10L) != 0)
+      f((long & 0x8L) != 0)
+      f((long & 0x4L) != 0)
+      f((long & 0x2L) != 0)
+      f((long & 0x1L) != 0)
+      ()
+    }
+
+    override def toPackedLong(endianness: BitChunk.Endianness)(implicit ev: Boolean <:< Boolean): Chunk[Long] =
+      if (minBitIndex == maxBitIndex) Chunk.empty
+      else if ((minBitIndex & bits - 1) != 0) ChunkPackedBoolean[Long](self, bits, endianness)
+      else if ((maxBitIndex & bits - 1) != 0) {
+        val minLongIndex = minBitIndex >> bitsLog2
+        val maxLongIndex = maxBitIndex >> bitsLog2
+        val maxLong      = elementAt(maxLongIndex)
+        val maxLongValue = maxLong >>> bits - (maxBitIndex & bits - 1)
+        val fullLongs    = longs.slice(minLongIndex, maxLongIndex)
+
+        if (self.endianness == endianness) fullLongs :+ respectEndian(endianness, maxLongValue)
+        else fullLongs.map(java.lang.Long.reverse) :+ respectEndian(endianness, maxLongValue)
+
+      } else if (self.endianness == endianness) longs
+      else longs.map(java.lang.Long.reverse)
+
+    private def respectEndian(endianness: BitChunk.Endianness, bigEndianValue: Long) =
+      if (endianness == BitChunk.Endianness.BigEndian) bigEndianValue
+      else java.lang.Long.reverse(bigEndianValue)
 
   }
 
+  private[zio] final case class ChunkPackedBoolean[T](
+    unpacked: Chunk[Boolean],
+    bits: Int,
+    endianness: Chunk.BitChunk.Endianness
+  )(implicit val ops: BitOps[T])
+      extends Chunk[T]
+      with ChunkIterator[T] {
+    self =>
+
+    import ops._
+
+    override val length: Int       = unpacked.length / bits + (if (unpacked.length % bits == 0) 0 else 1)
+    private def bitOr0(index: Int) = if (index < unpacked.length && unpacked(index)) one else zero
+    override def apply(n: Int): T =
+      if (n < 0 || n >= length)
+        throw new IndexOutOfBoundsException(s"Packed boolean chunk index $n out of bounds [0, $length)")
+      else {
+        val offset     = n * bits
+        val bitsToRead = if ((n + 1) * bits > unpacked.length) unpacked.length % bits else bits
+        var elem       = zero
+        var i          = bitsToRead - 1
+        while (i >= 0) {
+          val shiftBy = bitsToRead - 1 - i
+          val index   = offset + i
+          val shifted = <<(bitOr0(index), shiftBy)
+          elem = ops.|(elem, shifted)
+          i -= 1
+        }
+
+        if (endianness == BitChunk.Endianness.BigEndian) elem else ops.reverse(elem)
+      }
+
+    override def chunkIterator: ChunkIterator[T] =
+      self
+
+    def hasNextAt(index: Int): Boolean =
+      index < length
+
+    def nextAt(index: Int): T =
+      self(index)
+
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[T] =
+      if (offset < 0 && offset >= this.length) self
+      else ChunkPackedBoolean(unpacked.slice(offset * bits, length * bits), bits, endianness)
+  }
+
   private case object Empty extends Chunk[Nothing] { self =>
+
+    def chunkIterator: ChunkIterator[Nothing] =
+      ChunkIterator.empty
 
     override val length: Int =
       0
@@ -1810,45 +2372,287 @@ object Chunk extends ChunkFactory with ChunkPlatformSpecific {
 
     override def toArray[A1: ClassTag]: Array[A1] =
       Array.empty
-
-    override private[zio] def arrayIterator[A]: Iterator[Array[A]] =
-      Iterator.empty
-
-    override private[zio] def reverseArrayIterator[A]: Iterator[Array[A]] =
-      Iterator.empty
   }
 
-  final case class AnyRefArray[A <: AnyRef](array: Array[A]) extends Arr[A]
-
-  final case class ByteArray(array: Array[Byte]) extends Arr[Byte] {
-    override def byte(index: Int)(implicit ev: Byte <:< Byte): Byte = array(index)
+  final case class AnyRefArray[A <: AnyRef](array: Array[A], offset: Int, override val length: Int)
+      extends Arr[A]
+      with ChunkIterator[A] { self =>
+    def apply(index: Int): A =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[A] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): A =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[A] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else AnyRefArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class CharArray(array: Array[Char]) extends Arr[Char] {
-    override def char(index: Int)(implicit ev: Char <:< Char): Char = array(index)
+  final case class ByteArray(array: Array[Byte], offset: Int, override val length: Int)
+      extends Arr[Byte]
+      with ChunkIterator[Byte] { self =>
+    def apply(index: Int): Byte =
+      array(index + offset)
+    override def byte(index: Int)(implicit ev: Byte <:< Byte): Byte =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Byte] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Byte =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Byte] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else ByteArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class IntArray(array: Array[Int]) extends Arr[Int] {
-    override def int(index: Int)(implicit ev: Int <:< Int): Int = array(index)
+  final case class CharArray(array: Array[Char], offset: Int, override val length: Int)
+      extends Arr[Char]
+      with ChunkIterator[Char] { self =>
+    def apply(index: Int): Char =
+      array(index + offset)
+    override def char(index: Int)(implicit ev: Char <:< Char): Char =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Char] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Char =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Char] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else CharArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class LongArray(array: Array[Long]) extends Arr[Long] {
-    override def long(index: Int)(implicit ev: Long <:< Long): Long = array(index)
+  final case class IntArray(array: Array[Int], offset: Int, override val length: Int)
+      extends Arr[Int]
+      with ChunkIterator[Int] { self =>
+    def apply(index: Int): Int =
+      array(index + offset)
+    override def int(index: Int)(implicit ev: Int <:< Int): Int =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Int] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Int =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Int] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else IntArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class DoubleArray(array: Array[Double]) extends Arr[Double] {
-    override def double(index: Int)(implicit ev: Double <:< Double): Double = array(index)
+  final case class LongArray(array: Array[Long], offset: Int, override val length: Int)
+      extends Arr[Long]
+      with ChunkIterator[Long] { self =>
+    def apply(index: Int): Long =
+      array(index + offset)
+    override def long(index: Int)(implicit ev: Long <:< Long): Long =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Long] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Long =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Long] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else LongArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class FloatArray(array: Array[Float]) extends Arr[Float] {
-    override def float(index: Int)(implicit ev: Float <:< Float): Float = array(index)
+  final case class DoubleArray(array: Array[Double], offset: Int, override val length: Int)
+      extends Arr[Double]
+      with ChunkIterator[Double] { self =>
+    def apply(index: Int): Double =
+      array(index + offset)
+    override def double(index: Int)(implicit ev: Double <:< Double): Double =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Double] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Double =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Double] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else DoubleArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class ShortArray(array: Array[Short]) extends Arr[Short] {
-    override def short(index: Int)(implicit ev: Short <:< Short): Short = array(index)
+  final case class FloatArray(array: Array[Float], offset: Int, override val length: Int)
+      extends Arr[Float]
+      with ChunkIterator[Float] { self =>
+    def apply(index: Int): Float =
+      array(index + offset)
+    override def float(index: Int)(implicit ev: Float <:< Float): Float =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Float] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Float =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Float] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else FloatArray(array, self.offset + offset, self.length - offset min length)
   }
 
-  final case class BooleanArray(array: Array[Boolean]) extends Arr[Boolean] {
-    override def boolean(index: Int)(implicit ev: Boolean <:< Boolean): Boolean = array(index)
+  final case class ShortArray(array: Array[Short], offset: Int, override val length: Int)
+      extends Arr[Short]
+      with ChunkIterator[Short] { self =>
+    def apply(index: Int): Short =
+      array(index + offset)
+    override def short(index: Int)(implicit ev: Short <:< Short): Short =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Short] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Short =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Short] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else ShortArray(array, self.offset + offset, self.length - offset min length)
+  }
+
+  final case class BooleanArray(array: Array[Boolean], offset: Int, length: Int)
+      extends Arr[Boolean]
+      with ChunkIterator[Boolean] { self =>
+    def apply(index: Int): Boolean =
+      array(index + offset)
+    override def boolean(index: Int)(implicit ev: Boolean <:< Boolean): Boolean =
+      array(index + offset)
+    def chunkIterator: ChunkIterator[Boolean] =
+      self
+    def hasNextAt(index: Int): Boolean =
+      index < length
+    def nextAt(index: Int): Boolean =
+      array(index + offset)
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[Boolean] =
+      if (offset <= 0 && length >= self.length) self
+      else if (offset >= self.length || length <= 0) ChunkIterator.empty
+      else BooleanArray(array, self.offset + offset, self.length - offset min length)
+  }
+
+  /**
+   * A `ChunkIterator` is a specialized iterator that supports efficient
+   * iteration over chunks. Unlike a normal iterator, the caller is responsible
+   * for providing an `index` with each call to `hasNextAt` and `nextAt`. By
+   * contract this should be `0` initially and incremented by `1` each time
+   * `nextAt` is called. This allows the caller to maintain the current index in
+   * local memory rather than the iterator having to do it on the heap for array
+   * backed chunks.
+   */
+  sealed trait ChunkIterator[+A] { self =>
+
+    /**
+     * Checks if the chunk iterator has another element.
+     */
+    def hasNextAt(index: Int): Boolean
+
+    /**
+     * The length of the iterator.
+     */
+    def length: Int
+
+    /**
+     * Gets the next element from the chunk iterator.
+     */
+    def nextAt(index: Int): A
+
+    /**
+     * Returns a new iterator that is a slice of this iterator.
+     */
+    def sliceIterator(offset: Int, length: Int): ChunkIterator[A]
+
+    /**
+     * Concatenates this chunk iterator with the specified chunk iterator.
+     */
+    final def ++[A1 >: A](that: ChunkIterator[A1]): ChunkIterator[A1] =
+      ChunkIterator.Concat(self, that)
+  }
+
+  object ChunkIterator {
+
+    /**
+     * The empty iterator.
+     */
+    val empty: ChunkIterator[Nothing] =
+      Empty
+
+    /**
+     * Constructs an iterator from an array of arbitrary values.
+     */
+    def fromArray[A](array: Array[A]): ChunkIterator[A] =
+      array match {
+        case array: Array[AnyRef]  => Chunk.AnyRefArray(array, 0, array.length)
+        case array: Array[Boolean] => Chunk.BooleanArray(array, 0, array.length)
+        case array: Array[Byte]    => Chunk.ByteArray(array, 0, array.length)
+        case array: Array[Char]    => Chunk.CharArray(array, 0, array.length)
+        case array: Array[Double]  => Chunk.DoubleArray(array, 0, array.length)
+        case array: Array[Float]   => Chunk.FloatArray(array, 0, array.length)
+        case array: Array[Int]     => Chunk.IntArray(array, 0, array.length)
+        case array: Array[Long]    => Chunk.LongArray(array, 0, array.length)
+        case array: Array[Short]   => Chunk.ShortArray(array, 0, array.length)
+      }
+
+    /**
+     * Constructs an iterator from a `Vector`.
+     */
+    def fromVector[A](vector: Vector[A]): ChunkIterator[A] =
+      if (vector.length <= 0) Empty
+      else Iterator(vector.iterator, vector.length)
+
+    private final case class Concat[A](left: ChunkIterator[A], right: ChunkIterator[A]) extends ChunkIterator[A] {
+      self =>
+      def hasNextAt(index: Int): Boolean =
+        index < length
+      val length: Int =
+        left.length + right.length
+      def nextAt(index: Int): A =
+        if (left.hasNextAt(index)) left.nextAt(index)
+        else right.nextAt(index - left.length)
+      def sliceIterator(offset: Int, length: Int): ChunkIterator[A] =
+        if (offset <= 0 && length >= self.length) self
+        else if (offset >= self.length || length <= 0) Empty
+        else if (offset >= left.length) right.sliceIterator(offset - left.length, length)
+        else if (length <= left.length - offset) left.sliceIterator(offset, length)
+        else
+          Concat(
+            left.sliceIterator(offset, left.length - offset),
+            right.sliceIterator(0, offset + length - left.length)
+          )
+    }
+
+    private case object Empty extends ChunkIterator[Nothing] { self =>
+      def hasNextAt(index: Int): Boolean =
+        false
+      val length: Int =
+        0
+      def nextAt(index: Int): Nothing =
+        throw new ArrayIndexOutOfBoundsException(s"Empty chunk access to $index")
+      def sliceIterator(offset: Int, length: Int): ChunkIterator[Nothing] =
+        self
+    }
+
+    private final case class Iterator[A](iterator: scala.Iterator[A], length: Int) extends ChunkIterator[A] { self =>
+      def hasNextAt(index: Int): Boolean =
+        iterator.hasNext
+      def nextAt(index: Int): A =
+        iterator.next()
+      def sliceIterator(offset: Int, length: Int): ChunkIterator[A] =
+        if (offset <= 0 && length >= self.length) self
+        else if (offset >= self.length || length <= 0) Empty
+        else Iterator(iterator.slice(offset, offset + length), self.length - offset min length)
+    }
   }
 }

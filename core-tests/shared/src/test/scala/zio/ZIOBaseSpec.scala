@@ -1,15 +1,13 @@
 package zio
 
-import zio.duration._
 import zio.test._
-import zio.test.environment.Live
 
 import scala.annotation.tailrec
 
-trait ZIOBaseSpec extends DefaultRunnableSpec {
-  override def aspects: List[TestAspectAtLeastR[Live]] =
-    if (TestPlatform.isJVM) List(TestAspect.timeout(60.seconds))
-    else List(TestAspect.sequential, TestAspect.timeout(60.seconds))
+trait ZIOBaseSpec extends ZIOSpecDefault {
+  override def aspects: Chunk[TestAspectAtLeastR[Live]] =
+    if (TestPlatform.isJVM) Chunk(TestAspect.timeout(120.seconds))
+    else Chunk(TestAspect.timeout(120.seconds), TestAspect.sequential)
 
   sealed trait ZIOTag {
     val value: String
@@ -45,4 +43,5 @@ trait ZIOBaseSpec extends DefaultRunnableSpec {
       case Nil     => Nil
     }
   }
+
 }

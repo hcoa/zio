@@ -17,6 +17,7 @@
 package zio.internal
 
 import zio.{Chunk, ChunkBuilder}
+import zio.stacktracer.TracingImplicits.disableAutoTrace
 
 import java.util.concurrent.atomic._
 
@@ -91,7 +92,7 @@ private final class UnboundedHub[A] extends Hub[A] {
     true
   }
 
-  def publishAll(as: Iterable[A]): Chunk[A] = {
+  def publishAll[A1 <: A](as: Iterable[A1]): Chunk[A1] = {
     val iterator = as.iterator
     while (iterator.hasNext) {
       val a = iterator.next()

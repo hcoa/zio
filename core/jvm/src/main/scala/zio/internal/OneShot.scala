@@ -16,6 +16,8 @@
 
 package zio.internal
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 /**
  * A variable that can be set a single time. The synchronous, effectful
  * equivalent of `Promise`.
@@ -86,7 +88,7 @@ private[zio] final class OneShot[A] private (@volatile var value: A) {
 
 }
 
-object OneShot {
+private[zio] object OneShot {
 
   private final val nanosPerMilli = 1000000L
 

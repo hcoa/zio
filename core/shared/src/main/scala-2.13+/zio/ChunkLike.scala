@@ -16,6 +16,8 @@
 
 package zio
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 import scala.collection.immutable.{IndexedSeq, IndexedSeqOps, StrictOptimizedSeqOps}
 import scala.collection.{IterableFactoryDefaults, SeqFactory}
 import scala.reflect.ClassTag
@@ -57,26 +59,22 @@ trait ChunkLike[+A]
    * the specified function.
    */
   override final def flatMap[B](f: A => IterableOnce[B]): Chunk[B] = {
-    val iterator               = arrayIterator
+    val iterator               = self.chunkIterator
+    var index                  = 0
     var chunks: List[Chunk[B]] = Nil
     var total                  = 0
     var B0: ClassTag[B]        = null.asInstanceOf[ClassTag[B]]
-    while (iterator.hasNext) {
-      val array  = iterator.next()
-      val length = array.length
-      var i      = 0
-      while (i < length) {
-        val a     = array(i)
-        val bs    = f(a)
-        val chunk = ChunkLike.from(bs)
-        if (chunk.length > 0) {
-          if (B0 == null) {
-            B0 = Chunk.classTagOf(chunk)
-          }
-          chunks ::= chunk
-          total += chunk.length
+    while (iterator.hasNextAt(index)) {
+      val a = iterator.nextAt(index)
+      index += 1
+      val bs    = f(a)
+      val chunk = Chunk.from(bs)
+      if (chunk.length > 0) {
+        if (B0 == null) {
+          B0 = Chunk.classTagOf(chunk)
         }
-        i += 1
+        chunks ::= chunk
+        total += chunk.length
       }
     }
     if (B0 == null) Chunk.empty
@@ -95,12 +93,18 @@ trait ChunkLike[+A]
   }
 
   /**
+   * Flattens a chunk of chunks into a single chunk by concatenating all chunks.
+   */
+  override def flatten[B](implicit ev: A => IterableOnce[B]): Chunk[B] =
+    flatMap(ev(_))
+
+  /**
    * Returns a `SeqFactory` that can construct `Chunk` values. The `SeqFactory`
    * exposes a `newBuilder` method that is not referentially transparent because
    * it allocates mutable state.
    */
   override val iterableFactory: SeqFactory[Chunk] =
-    ChunkLike
+    Chunk
 
   /**
    * Returns a chunk with the elements mapped by the specified function.
@@ -108,38 +112,12 @@ trait ChunkLike[+A]
   override final def map[B](f: A => B): Chunk[B] =
     mapChunk(f)
 
+  override final def updated[A1 >: A](index: Int, elem: A1): Chunk[A1] =
+    update(index, elem)
+
   /**
    * Zips this chunk with the index of every element.
    */
   override final def zipWithIndex: Chunk[(A, Int)] =
     zipWithIndexFrom(0)
-}
-
-object ChunkLike extends SeqFactory[Chunk] {
-
-  /**
-   * Returns the empty `Chunk`.
-   */
-  def empty[A]: Chunk[A] =
-    Chunk.empty
-
-  /**
-   * Constructs a `Chunk` from the specified `IterableOnce`.
-   */
-  def from[A](source: IterableOnce[A]): Chunk[A] =
-    source match {
-      case iterable: Iterable[A] => Chunk.fromIterable(iterable)
-      case iterableOnce =>
-        val chunkBuilder = ChunkBuilder.make[A]()
-        iterableOnce.iterator.foreach(chunkBuilder.addOne)
-        chunkBuilder.result()
-    }
-
-  /**
-   * Constructs a new `ChunkBuilder`. This operation allocates mutable state and
-   * is not referentially transparent. It is provided for compatibility with
-   * Scala's collection library and should not be used for other purposes.
-   */
-  def newBuilder[A]: ChunkBuilder[A] =
-    ChunkBuilder.make()
 }

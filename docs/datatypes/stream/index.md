@@ -6,9 +6,9 @@ title: "Introduction"
 ```scala mdoc:invisible
 import zio.{ZIO, Task}
 import zio.Queue
-import zio.stream.{ZStream, ZTransducer}
+import zio.stream.{ZStream, ZPipeline}
 import java.nio.file.{Files, Path, Paths}
-import zio.console._
+import zio.Console._
 import java.io.IOException
 ```
 
@@ -36,17 +36,19 @@ So streams are everywhere. We can see all of these different things as being str
 
 ## Motivation
 
-Assume, we would like to take a list of numbers and grab all the prime numbers and then do some more hard work on each of these prime numbers. We can do it using `ZIO.foreachParN` and `ZIO.filterPar` operators like this:
+Assume, we would like to take a list of numbers and grab all the prime numbers and then do some more hard work on each of these prime numbers. We can do it using `ZIO.foreachPar` and `ZIO.filterPar` operators like this:
 
 ```scala mdoc:silent
-def isPrime(number: Int): Task[Boolean] = Task.succeed(???)
-def moreHardWork(i: Int): Task[Boolean] = Task.succeed(???)
+import zio.ZIOAspect._
+
+def isPrime(number: Int): Task[Boolean] = ZIO.succeed(???)
+def moreHardWork(i: Int): Task[Boolean] = ZIO.succeed(???)
 
 val numbers = 1 to 1000
 
 for {
   primes <- ZIO.filterPar(numbers)(isPrime)
-  _      <- ZIO.foreachParN(20)(primes)(moreHardWork)
+  _      <- ZIO.foreachPar(primes)(moreHardWork) @@ parallel(20)
 } yield ()
 ```
 
@@ -61,12 +63,12 @@ There are two problems with this example:
 With ZIO stream we can change this program to the following code:
 
 ```scala mdoc:silent:nest
-def prime(number: Int): Task[(Boolean, Int)] = Task.succeed(???)
+def prime(number: Int): Task[(Boolean, Int)] = ZIO.succeed(???)
 
 ZStream.fromIterable(numbers)
-  .mapMParUnordered(20)(prime(_))
+  .mapZIOParUnordered(20)(prime(_))
   .filter(_._1).map(_._2)
-  .mapMParUnordered(20)(moreHardWork(_))
+  .mapZIOParUnordered(20)(moreHardWork(_))
 ```
 
 We converted the list of numbers using `ZStream.fromIterable` into a `ZStream`, then we mapped it in parallel, twenty items at a time, and then we performed the hard work problem, twenty items of a time. This is a pipeline, and this easily works for an infinite list.
@@ -74,9 +76,9 @@ We converted the list of numbers using `ZStream.fromIterable` into a `ZStream`, 
 One might ask, "Okay, I can get the pipelining by using fibers and queues. So why should I use ZIO streams?". It is extremely tempting to write up the pipeline look like this. We can create a bunch of queues and fibers, then we have fibers that copy information between the queues and perform the processing concurrently. It ends up something like this:
 
 ```scala mdoc:silent:nest
-def writeToInput(q: Queue[Int]): Task[Unit]                            = Task.succeed(???)
-def processBetweenQueues(from: Queue[Int], to: Queue[Int]): Task[Unit] = Task.succeed(???)
-def printElements(q: Queue[Int]): Task[Unit]                           = Task.succeed(???)
+def writeToInput(q: Queue[Int]): Task[Unit]                            = ZIO.succeed(???)
+def processBetweenQueues(from: Queue[Int], to: Queue[Int]): Task[Unit] = ZIO.succeed(???)
+def printElements(q: Queue[Int]): Task[Unit]                           = ZIO.succeed(???)
 
 for {
   input  <- Queue.bounded[Int](16)
@@ -96,16 +98,16 @@ There are some problems with this solution. As fibers are low-level concurrency 
 Although fibers are very efficient and more performant than threads. They are advanced concurrency tools. So it is better to avoid using them to do manual pipelining. Instead, we can use ZIO streams:
 
 ```scala mdoc:silent:nest
-def generateElement: Task[Int]    = Task.succeed(???)
-def process(i: Int): Task[Int]    = Task.succeed(???)
-def printElem(i: Int): Task[Unit] = Task.succeed(???)
+def generateElement: Task[Int]    = ZIO.succeed(???)
+def process(i: Int): Task[Int]    = ZIO.succeed(???)
+def printElem(i: Int): Task[Unit] = ZIO.succeed(???)
 
 ZStream
-  .repeatEffect(generateElement)
+  .repeatZIO(generateElement)
   .buffer(16)
-  .mapM(process(_))
+  .mapZIO(process(_))
   .buffer(16)
-  .mapM(process(_))
+  .mapZIO(process(_))
   .buffer(16)
   .tap(printElem(_))
 ```
@@ -126,7 +128,7 @@ They're reactive streams, they don't block threads. They're super-efficient and 
 
 ### 3. Concurrency and Parallelism
 
-Streams are concurrent. They have a lot of concurrent operators. All the operations on them are safe to use in presence of concurrency. And also just like ZIO gives us parallel operators with everything, there are lots of parallel operators. We can use the parallel version of operators, like `mapMPar`, `flatMapPar`.
+Streams are concurrent. They have a lot of concurrent operators. All the operations on them are safe to use in presence of concurrency. And also just like ZIO gives us parallel operators with everything, there are lots of parallel operators. We can use the parallel version of operators, like `mapZIOPar`, `flatMapPar`.
 
 Parallel operators allow us to fully saturate and utilize all CPU cores of our machine. If we need to do bulk processing on a lot of data and use all the cores on our machine, so we can speed up the process by using these parallel operators. 
 
@@ -148,7 +150,7 @@ ZIO Streams are working at the level of chunks. Every time we are working with Z
 
 ### 6. Seamless Integration with ZIO
 
-ZIO stream has a powerful seamless integrated support for ZIO. It uses `ZManaged`, `Schedule`, and any other powerful data types in ZIO. So we can stay within the same ecosystem and get all its significant benefits.
+ZIO stream has a powerful seamless integrated support for ZIO. It uses `Scope`, `Schedule`, and any other powerful data types in ZIO. So we can stay within the same ecosystem and get all its significant benefits.
 
 ### 7. Back-Pressure
 
@@ -182,22 +184,22 @@ for (line <- FileUtils.readFileToString(new File("file.txt")).split('\n'))
 The only problem here is that if we run this code with a file that is very large which is bigger than our memory, that is not going to work. Instead, we can reach the same functionality, by using the stream API:
 
 ```scala mdoc:silent:nest
-ZStream.fromFile(Paths.get("file.txt"))
-  .transduce(ZTransducer.utf8Decode >>> ZTransducer.splitLines)
-  .foreach(putStrLn(_))
+ZStream.fromFileName("file.txt")
+  .via(ZPipeline.utf8Decode >>> ZPipeline.splitLines)
+  .foreach(printLine(_))
 ```
 
 By using ZIO streams, we do not care how big is a file, we just concentrate on the logic of our application.
 
 ## Core Abstractions
 
-To define a stream workflow there are three core abstraction in ZIO stream; _Streams_, _Sinks_, and _Transducers_:
+To define a stream workflow there are three core abstraction in ZIO stream; _Streams_, _Sinks_, and _Pipelines_:
 
 1. **[ZStream](zstream.md)** — Streams act as _sources_ of values. We get elements from them. They produce values.
 
 2. **[ZSink](zsink.md)** — Sinks act as _receptacles_ or _sinks_ for values. They consume values.
 
-3. **[Transducer](ztransducer.md)** — Transducers act as _transformers_ of values. They take individual values, and they transform or decode them. 
+3. **[ZPipeline](zpipeline.md)** — Pipelines act as _transformers_ of values. They take individual values, and they transform or decode them. 
 
 ### Stream
 
@@ -225,22 +227,20 @@ Just like Streams, sinks are super compositional. Sink's operators allow us to c
 
 Streams and Sinks are duals in category theory. One produces value, and the other one consumes them. They are mere images of each other. They both have to exist. A streaming library cannot be complete unless it has streams and sinks. That is why ZIO has a sort of better design than FS2 because FS2 has a stream, but it doesn't have a sink. Its Sink is just faked. It doesn't actually have a real sink. ZIO has a real sink, and we can compose them to generate new sinks.
 
-### Transducer
+### Pipeline
 
-With `Transducer`s, we can transform streams from one type to another, in a **stateful fashion**, which is sometimes necessary when we are doing encoding and decoding. 
+With `Pipeline`s, we can transform streams from one type to another, in a **stateful fashion**, which is sometimes necessary when we are doing encoding and decoding. 
 
-Transducer is a transformer of element types. Transducer accepts some element of type `A` and produces some element of type `B`, and it may fail along the way or use the environment. It just transforms elements from one type to another type in a stateful way. 
+Pipeline is a transformer of element types. Pipeline accepts some element of type `A` and produces some element of type `B`, and it may fail along the way or use the environment. It just transforms elements from one type to another type in a stateful way. 
 
-For example, we can write counter with transducers. We take strings and then split them into lines, and then we take the lines, and we split them into words, and then we count them. 
+For example, we can write counter with pipelines. We take strings and then split them into lines, and then we take the lines, and we split them into words, and then we count them. 
 
-Another common use case of transducers is **writing codecs**. We can use them to decode the bytes into strings. We have a bunch of bytes, and we want to end up with a JSON and then once we are in JSON land we want to go from JSON to our user-defined data type. So, by writing a transducer we can convert that JSON to our user-defined data type.
+Another common use case of pipelines is **writing codecs**. We can use them to decode the bytes into strings. We have a bunch of bytes, and we want to end up with a JSON and then once we are in JSON land we want to go from JSON to our user-defined data type. So, by writing a pipeline we can convert that JSON to our user-defined data type.
 
-**Transducers are very efficient**. They only exist for efficiency reasons because we can do everything we need actually with Sinks. Transducers exist only to make transformations faster. Sinks are not super fast to change from one sink to another. So transducers were invented to make it possible to transform element types in a compositional way without any of the performance overhead associated with changing over a Sink. 
+Pipelines can be thought of as **element transformers**. They transform elements of a stream:
 
-Transducers can be thought of as **element transformers**. They transform elements of a stream:
+1. We can take a pipeline, and we can stack it onto a stream to change the element type. For example, we have a Stream of `A`s, and a pipeline that goes from `A` to `B`, so we can take that pipeline from `A` to `B` and stack it on the stream to get back a stream of `B`s. 
 
-1. We can take a transducer, and we can stack it onto a stream to change the element type. For example, we have a Stream of `A`s, and a transducer that goes from `A` to `B`, so we can take that transducer from `A` to `B` and stack it on the stream to get back a stream of `B`s. 
+2. Also, we can stack a pipeline onto the front of a sink to change the input element type. If some sink consumes `B`s, and we have a pipeline from `A` to `B` we can take that pipeline stack it onto the front of the sink and get back a new sink that consumes `A`s. 
 
-2. Also, we can stack a transducer onto the front of a sink to change the input element type. If some sink consumes `B`s, and we have a transducer from `A` to `B` we can take that transducer stack it onto the front of the sink and get back a new sink that consumes `A`s. 
-
-Assume we are building the data pipeline, the elements come from the far left, and they end up on the far right. Events come from the stream, they end up on the sink, along the way they're transformed by transducers. **Transducers are the middle section of the pipe that keep on transforming those elements in a stateful way**. 
+Assume we are building the data pipeline, the elements come from the far left, and they end up on the far right. Events come from the stream, they end up on the sink, along the way they're transformed by pipelines. **Pipelines are the middle section of the pipe that keep on transforming those elements in a stateful way**. 

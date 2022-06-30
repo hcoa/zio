@@ -16,13 +16,15 @@
 
 package zio.internal
 
-final class RingBufferPow2[A](val requestedCapacity: Int)
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
+private[zio] final class RingBufferPow2[A](val requestedCapacity: Int)
     extends RingBuffer[A](RingBuffer.nextPow2(requestedCapacity)) {
   protected def posToIdx(pos: Long, capacity: Int): Int =
     (pos & (capacity - 1).toLong).toInt
 }
 
-object RingBufferPow2 {
+private[zio] object RingBufferPow2 {
   def apply[A](requestedCapacity: Int): RingBufferPow2[A] = {
     assert(requestedCapacity > 0)
 

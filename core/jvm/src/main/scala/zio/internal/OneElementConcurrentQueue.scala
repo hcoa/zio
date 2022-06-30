@@ -16,6 +16,8 @@
 
 package zio.internal
 
+import zio.stacktracer.TracingImplicits.disableAutoTrace
+
 import java.io.Serializable
 import java.util.concurrent.atomic.{AtomicReference, LongAdder}
 
@@ -42,7 +44,7 @@ import java.util.concurrent.atomic.{AtomicReference, LongAdder}
  * Space losses: 0 bytes internal + 0 bytes external = 0 bytes total
  */
 // format: on
-final class OneElementConcurrentQueue[A] extends MutableConcurrentQueue[A] with Serializable {
+private[zio] final class OneElementConcurrentQueue[A] extends MutableConcurrentQueue[A] with Serializable {
   private[this] val ref      = new AtomicReference[AnyRef]()
   private[this] val deqAdder = new LongAdder()
 
